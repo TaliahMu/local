@@ -24,4 +24,18 @@ class Scores(dj.Manual):
     ot_losses : int
     points : int
     """
+
+    #my_array2 = np.genfromtxt('data2.txt',
+                      #skip_header=1,
+                      #missing_values = nan,
+                      #filling_values=0)
+   
     
+my_array2 = np.genfromtxt('data2.txt',
+    skip_header=1,
+    missing_values = 'nan',
+    filling_values=0)
+score = my_array2[:,3:9]
+age = my_array2[:,1]-my_array2[:,0]
+
+#figure out how to add columns and import these numpy arrays into dj tables
