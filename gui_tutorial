@@ -1,0 +1,170 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import tkinter"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "top = tkinter.Tk()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "top.mainloop()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 14,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "top = tkinter.Tk()\n",
+    "w = Entry(top,bg='blue',cursor='dot',highlightcolor='green')\n",
+    "top.mainloop()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 11,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import tkinter\n",
+    "top = tkinter.Tk()\n",
+    "w = Entry(top,bd=3)\n",
+    "top.mainloop()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from tkinter import *\n",
+    "\n",
+    "top = Tk()\n",
+    "L1 = Label(top, text=\"User Name\")\n",
+    "L1.pack( side = LEFT)\n",
+    "E1 = Entry(top, bd =5)\n",
+    "E1.pack(side = RIGHT)\n",
+    "\n",
+    "top.mainloop()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "from tkinter import *\n",
+    " \n",
+    "def donothing():\n",
+    "   x = 0\n",
+    " \n",
+    "root = Tk()\n",
+    " \n",
+    "menubar = Menu(root)\n",
+    "filemenu = Menu(menubar, tearoff=0)\n",
+    "filemenu.add_command(label=\"New\", command=donothing)\n",
+    "filemenu.add_command(label=\"Open\", command=donothing)\n",
+    "filemenu.add_command(label=\"Save\", command=donothing)\n",
+    "filemenu.add_separator()\n",
+    "filemenu.add_command(label=\"Exit\", command=root.quit)\n",
+    "menubar.add_cascade(label=\"File\", menu=filemenu)\n",
+    " \n",
+    "helpmenu = Menu(menubar, tearoff=0)\n",
+    "helpmenu.add_command(label=\"Help Index\", command=donothing)\n",
+    "helpmenu.add_command(label=\"About...\", command=donothing)\n",
+    "menubar.add_cascade(label=\"Help\", menu=helpmenu)\n",
+    " \n",
+    "root.config(menu=menubar)\n",
+    "root.mainloop()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "#!/usr/bin/env python\n",
+    "from tkinter import *\n",
+    " \n",
+    "def donothing():\n",
+    "   x = 0\n",
+    " \n",
+    "root = Tk()\n",
+    " \n",
+    "menubar = Menu(root)\n",
+    "filemenu = Menu(menubar, tearoff=0)\n",
+    "filemenu.add_command(label=\"New\", command=donothing)\n",
+    "filemenu.add_command(label=\"Open\", command=donothing)\n",
+    "filemenu.add_command(label=\"Save\", command=donothing)\n",
+    "filemenu.add_separator()\n",
+    "filemenu.add_command(label=\"Exit\", command=root.quit)\n",
+    "menubar.add_cascade(label=\"File\", menu=filemenu)\n",
+    " \n",
+    "helpmenu = Menu(menubar, tearoff=0)\n",
+    "helpmenu.add_command(label=\"Help Index\", command=donothing)\n",
+    "helpmenu.add_command(label=\"About...\", command=donothing)\n",
+    "menubar.add_cascade(label=\"Help\", menu=helpmenu)\n",
+    " \n",
+    "editmenu = Menu(menubar, tearoff=0)\n",
+    "editmenu.add_command(label=\"Cut\", command=donothing)\n",
+    "editmenu.add_command(label=\"Copy\", command=donothing)\n",
+    "editmenu.add_command(label=\"Past\", command=donothing)\n",
+    "editmenu.add_command(label=\"Duplicate Line\", command=donothing)\n",
+    "editmenu.add_command(label=\"Toggle Case\", command=donothing)\n",
+    "menubar.add_cascade(label=\"Edit\",menu=editmenu)\n",
+    " \n",
+    "root.config(menu=menubar)\n",
+    "root.mainloop()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.6.4"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
