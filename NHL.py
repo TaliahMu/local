@@ -11,6 +11,9 @@ class Teams(dj.Manual):
         established:int  #year established
         ended:int   #year ended or current year active
         """
+
+#Data in 'data.txt' file
+#
 @schema
 class Info(dj.Lookup):
         definition = """
@@ -79,34 +82,74 @@ class Chances(dj.Computed):
                 self.insert1(key)
                 print('Computed percent chance of winning for franchise {team}'.format(**key))
 
-about = np.genfromtxt('data.txt',
-                      skip_header=1)
-my_array2 = np.genfromtxt('data2.txt',
-    skip_header=1,
-    missing_values = 'nan',
-    filling_values=0)
-score = my_array2[:,4:9]
-score = score.astype(int)
-score[score<-5] = 0 
-age = my_array2[:,1]-my_array2[:,0]
-team = np.arange(1,58)[...,None]
+#added replica of Teams() called Test() by:
+#        about = np.genfromtxt('data.txt',skip_header=1)
+#        about=about.astype(int)
+#        Test.insert(about)
+@schema
+class Test(dj.Manual):
+	definition = """
+        #Team names and how long they've been active
+        team:int #NHL team name
+        ---
+        established:int  #year established
+        ended:int   #year ended or current year active
+        """
 
-
-#figure out how to add columns and import these numpy arrays into dj tables
 numbers = np.arange(1,58)[...,None]
 file = open('data3.txt')
 names = file.readlines()
 del(names[0])
-team_names = np.array(names)[...,None]
-age =(Teams().fetch('ended')-Teams().fetch('established'))[...,None]
+with open("data3.txt") as file:
+    names = []
+    for line in file:
+        # The rstrip method gets rid of the "\n" at the end of each line
+        names.append(line.rstrip().split(","))
+flat_list = [item for sublist in names for item in sublist]
+team_names = np.array(flat_list)[...,None]
+age =(Test().fetch('ended')-Test().fetch('established'))[...,None]
 combined = np.append(numbers, team_names, 1)
 combined = np.append(combined, age, 1)
-combined.astype(list)
+
+
+
+
+
+
+
+
+#        about = np.genfromtxt('data.txt',
+#                              skip_header=1)
+#        my_array2 = np.genfromtxt('data2.txt',
+#            skip_header=1,
+#            missing_values = 'nan',
+#            filling_values=0)
+#        score = my_array2[:,4:9]
+#        score = score.astype(int)
+#        score[score<-5] = 0 
+#        age = my_array2[:,1]-my_array2[:,0]
+#        team = np.arange(1,58)[...,None]
+
+
+#figure out how to add columns and import these numpy arrays into dj tables
+#the [...,None] changes list to list of lists
+#        numbers = np.arange(1,58)[...,None]
+#        file = open('data3.txt')
+#        names = file.readlines()
+#        del(names[0])
+#        team_names = np.array(names)[...,None]
+#        age =(Teams().fetch('ended')-Teams().fetch('established'))[...,None]
+#        combined = np.append(numbers, team_names, 1)
+#        combined = np.append(combined, age, 1)
+#idk why it'd be asytpe list
+#combined.astype(list)
 
 
 #without creating a table just querrying figure out the correlation coeffiecent
 #for the chances of winning versus the age of the franchise
 #jk maybe create a table for odds of winning compared to age,
+
+
 
 
 

@@ -1,0 +1,17 @@
+{
+    "database.host": "tutorial-db.datajoint.io",
+    "database.password": "taliahchangeme123",
+    "database.user": "TaliahMu",
+    "database.port": 3306,
+    "connection.init_function": null,
+    "database.reconnect": false,
+    "loglevel": "INFO",
+    "safemode": true,
+    "display.limit": 7,
+    "display.width": 14,
+    "display.show_tuple_count": true,
+    "history": [
+        "No config file found, using default settings.",
+        "Updated from config file: dj_local_conf.json"
+    ]
+}
