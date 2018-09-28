@@ -1,49 +1,21 @@
-def Function(a,avgframes=100,field=1):
-    """
-    a. Enter a dictionary that includes animal_id, session, and scan_idx
-    b. Enter the number of frames to average to display image
-        -Default is 100
-    c. Enter which field to view
-        -Default is 1
-    Returns: Number of files for the scan, size and number of frames for each
-    file, number of frames used for averaging to store tif files, and an example
-    image using the average of the sampled frames.
-    """
-    key = a
-    sample = avgframes
-    animal_id = str((experiment.Scan() & key).fetch('animal_id')[0])
-    session = str((experiment.Scan() & key).fetch('session')[0])
-    scan_idx = str((experiment.Scan() & key).fetch('scan_idx')[0])
-    ############################################################
-    #DISPLAYS NUMBER OF FILES FOR THE SCAN
+def Function(key,sample=100,field=1):
+    animal_id = str((experiment.Scan() & key).fetch1('animal_id'))
+    session = str((experiment.Scan() & key).fetch1('session'))
+    scan_idx = str((experiment.Scan() & key).fetch1('scan_idx'))
     import glob
     scan_filename = (experiment.Scan() & key).local_filenames_as_wildcard
     nfiles = len(glob.glob(scan_filename))
     print('Scan {}-{}-{} has {} file(s).'.format(animal_id,session,scan_idx,nfiles))
-    ############################################################
-    #DISPLAYS SIZE AND NUMBER OF FRAMES FOR EACH FILE
-    #assumes that if frames are the same size, they have the same number of frames!
-    #b/c searching the number of frames for each file with scanreader takes too long
-    import glob
     import os
-    samesize, diff = [], []
+    diff = []
     for i in range(nfiles):
-        x = str(i+1)
-        if i <= 8:
-            filename = scan_filename[:-5] + '_0000{}.tif'.format(x)
-        elif 98 >= i >= 9:
-            filename = scan_filename[:-5] + '_000{}.tif'.format(x)
-        elif 998 >= i >= 99:
-            filename = scan_filename[:-5] + '_00{}.tif'.format(x)
-        y = os.path.getsize(filename) / 1000000
-        y = str(round(y,1))
+        x = i+1
+        filename = scan_filename[:-5] + '_{}.tif'.format("%05d" % (x,))
+        y = round((os.path.getsize(filename) / 1000000),1)
         scan = scanreader.read_scan(filename)
         if i == 0:
             size = [y]
-            samesize.append(1)
             nframes = scan.num_frames
-        elif y in size:
-            samesize.append(int(x))
         elif y not in size:
             diff.append(y)
             z = scan.num_frames
@@ -52,12 +24,8 @@ def Function(a,avgframes=100,field=1):
         print ('All other files are {} MB and have {} frames.'.format(size[0], nframes))
     elif len(diff) == 0:
         print ('All files are {} MB and have {} frames.'.format(size[0], nframes))
-    #############################################################
-    #DISPLAYS AVERAGING?????
-    z = 1 #find out what the averaging was set to
-    print('Averaging {} frame(s).'.format(z))
-    #############################################################
-    #DISPLAYS EXAMPLE IMAGE
+    avg = 1 ###DISPLAYS AVERAGING?????#find out what the averaging was set to
+    print('Averaging {} frame(s).'.format(avg))
     scan = scanreader.read_scan(scan_filename)
     nframes = scan.num_frames
     stepsize = int(nframes/sample)
