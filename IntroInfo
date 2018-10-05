@@ -1,4 +1,12 @@
-def Function(key,sample=100,field=1):
+def Function(key,sample=100,field=1,gbright = 1,rbright=1): 
+    """
+    Takes dictionary of a particular scan and displays the number of files, the size of each file,
+    the number of frames per file, the number of averaged frames, and plots an example image 
+    using the average of a few frames.
+    sample = number of frames used in average image
+    field = which field to view in a particular scans 
+    Brighter w/ brights closer to zero
+    """
     animal_id = str((experiment.Scan() & key).fetch1('animal_id'))
     session = str((experiment.Scan() & key).fetch1('session'))
     scan_idx = str((experiment.Scan() & key).fetch1('scan_idx'))
@@ -26,14 +34,15 @@ def Function(key,sample=100,field=1):
         print ('All files are {} MB and have {} frames.'.format(size[0], nframes))
     avg = 1 ###DISPLAYS AVERAGING?????#find out what the averaging was set to
     print('Averaging {} frame(s).'.format(avg))
-    scan = scanreader.read_scan(scan_filename)
+    #scan = scanreader.read_scan(scan_filename)
+    scan = scanreader.read_scan(scan_filename, dtype=np.float32, join_contiguous=True)
     nframes = scan.num_frames
     stepsize = int(nframes/sample)
-    ch1 = scan[(field-1),:,:,0,0:nframes:stepsize].mean(axis=-1)
-    green = ch1/(np.max(ch1)*.8)
+    ch1 = scan[(field-1),:,:,0,0:nframes:stepsize].mean(axis=-1) 
+    green = ch1/(np.max(ch1)*(.8*gbright)) # 5-d array [fields, y, x, channel, frames]
     if scan.num_channels == 2:
         ch2 = scan[(field-1),:,:,1,0:nframes:stepsize].mean(axis=-1)
-        red = ch2 / (np.max(ch2)*.2)
+        red = ch2 / (np.max(ch2)*(.2*rbright)) # 5-d array [fields, y, x, channel, frames]
     else:
         red = np.zeros(np.shape(ch1))
     blue = np.zeros(np.shape(ch1))
