@@ -1,0 +1,1784 @@
+"""
+Analysis of visual tuning: receptive fields, tuning curves, pixelwise maps
+It differs from tuning.py in that it uses the new visual stimulus schema `stimulus` whereas tuning was using `vis`
+"""
+from distutils.version import StrictVersion
+
+import itertools
+import os
+from pprint import pformat
+from functools import partial
+from warnings import warn
+
+import datajoint as dj
+
+assert StrictVersion(dj.__version__) >= StrictVersion("0.10.0"), "upgrade datajoint"
+
+import numpy as np
+import scanreader
+from datajoint.jobs import key_hash
+from pipeline import fuse, experiment, notify
+from pipeline.exceptions import PipelineException
+from scipy.interpolate import interp1d
+from tqdm import tqdm
+
+from ._utils import corr, fill_nans, SplineCurve
+from stimulus import stimulus
+
+from scipy.ndimage import filters
+from scipy import signal
+
+dj.config['external-analysis'] = dict(
+    protocol='file',
+    location='/mnt/scratch05/datajoint-store/analysis')
+
+dj.config['external-maps'] = dict(
+    protocol='s3',
+    endpoint="kobold.ad.bcm.edu:9000",
+    bucket='microns-pipelines',
+    location='maps',
+    access_key="21IYGREPV4RS3IUU9ZYX",
+    secret_key="yzGLiu7ndHzMSCrobTliCpRDpP9WGdRv7YmrieJ0")
+
+dj.config['cache'] = os.path.expanduser('/mnt/data/dj-cache')
+
+schema = dj.schema('pipeline_tune', create_tables=True)
+
+
+@schema
+class CaMovie(dj.Computed):
+    definition = """
+    # Corrected calcium movie
+    -> fuse.MotionCorrection
+    -> stimulus.Sync
+    ---
+    -> shared.Channel
+    corrected_scan  :  external-analysis   # motion corrected uint16
+    scale_factor    :  float               # scale back to float
+    """
+
+    def make(self, key):
+        from pipeline.utils import galvo_corrections
+        scan = scanreader.read_scan((experiment.Scan & key).local_filenames_as_wildcard)
+        if experiment.Session.PMTFilterSet() & key & {'pmt_filter_set': '3P1 green-THG'}:
+            key['channel'] = 2
+        else:
+            key['channel'] = 1
+        scan = scan[key['field'] - 1, :, :, key['channel'] - 1].astype(np.float32)
+
+        # raster correction
+        pipe = (fuse.MotionCorrection() & key).module
+        raster_phase = (pipe.RasterCorrection() & key).fetch1('raster_phase')
+        fill_fraction = (pipe.ScanInfo() & key).fetch1('fill_fraction')
+        scan = galvo_corrections.correct_raster(scan, raster_phase, fill_fraction)
+
+        # motion correction
+        y_shifts, x_shifts = (pipe.MotionCorrection() & key).fetch1('y_shifts', 'x_shifts')
+        scan = galvo_corrections.correct_motion(scan, np.stack([x_shifts, y_shifts]))
+        maxint16 = 2 ** 15 - 1
+        scale = np.abs(scan).max() / maxint16
+        scan = (scan / scale).astype(np.int16)
+
+        self.insert1(dict(key, scale_factor=scale, corrected_scan=scan))
+
+
+@schema
+class CaTimes(dj.Computed):
+    definition = """
+    -> fuse.MotionCorrection
+    -> stimulus.Sync
+    ---
+    nfields : int
+    times  : longblob   # times corresponding to the movie frame
+    """
+
+    def make(self, key):
+        pipe = (fuse.MotionCorrection & key).module
+        nfields = len(dj.U('z') & (pipe.ScanInfo.Field & (pipe.ScanInfo & key).proj()))
+        delay = (pipe.ScanInfo.Field & key).fetch1('delay_image').mean()
+        frame_times = (stimulus.Sync & key).fetch1('frame_times', squeeze=True)
+        self.insert1(dict(key,
+                          nfields=nfields,
+                          times=frame_times[::nfields] + delay))
+
+
+@schema
+class Drift(dj.Computed):
+    definition = """
+    # all directional drift trials for the scan
+    -> stimulus.Sync
+    ---
+    unique_directions : longblob  # (degrees)
+    ndirections       : tinyint   # number of unique directions
+    """
+
+    class Trial(dj.Part):
+        definition = """
+        -> Drift
+        drift_trial: smallint  # trial index
+        ---
+        -> stimulus.Trial
+        direction: float  # (degrees) direction of drift
+        onset: double  # (s) onset time in rf.Sync times
+        offset: double  # (s) offset time in rf.Sync times
+        """
+
+    @property
+    def key_source(self):
+        return stimulus.Sync() & (stimulus.Trial() & [
+            stimulus.Monet() & 'speed>0',
+            stimulus.Monet2() & 'speed>0'])
+
+    @staticmethod
+    def _generate_trials(key, unique_directions):
+        trial_count = itertools.count()
+        monet1 = stimulus.Monet() * stimulus.Trial()
+        monet2 = (stimulus.Monet2() * stimulus.Trial()).proj(
+            'flip_times', 'onsets', 'directions', 'speed', 'fps',
+            ori_on_secs='round(1000*duration/n_dirs*ori_fraction)/1000')
+        for monet, unit in ((monet1, 'rad'), (monet2, 'degree')):
+            for trial_key,  onsets, directions, ori_duration, times, fps in zip(
+                    *(monet & key & 'speed>0').fetch(
+                        dj.key, 'onsets', 'directions', 'ori_on_secs', 'flip_times', 'fps', squeeze=True)):
+                if unit == 'rad':
+                    directions *= 180 / np.pi
+                round_factor = 1e4
+                directions = np.round(directions * round_factor) / round_factor
+                unique_directions.update(directions)
+                assumed_times = np.r_[:times.size] / float(fps)
+                for onset, offset, direction in zip(
+                        np.interp(onsets, assumed_times, times),
+                        np.interp(onsets + ori_duration, assumed_times, times),
+                        directions):
+                    yield dict(trial_key, drift_trial=next(trial_count),
+                               onset=onset, offset=offset, direction=direction)
+
+    def make(self, key):
+        unique_directions = set()
+        tuples = list(self._generate_trials(key, unique_directions))
+        unique_directions = np.array(sorted(list(unique_directions)))
+        self.insert1(dict(key,
+                          unique_directions=unique_directions,
+                          ndirections=unique_directions.size))
+        self.Trial().insert(tuples, ignore_extra_fields=True)
+
+
+@schema
+class OriDesign(dj.Computed):
+    definition = """
+    # The design matrix for directional responses in Monet and Monet2 movies
+    -> Drift
+    ---
+    tau         : decimal(4,3)  # (s)
+    regressors  : longblob      # matrix of orientation regressors
+    """
+
+    def make(self, key):
+        tau = 0.7
+        frame_times = (stimulus.Sync() & key).fetch1('frame_times', squeeze=True)
+        unique_directions = (Drift() & key).fetch1('unique_directions')
+        regressors = np.zeros((frame_times.size, unique_directions.size), dtype=np.float32)
+        for onset, offset, direction in zip(
+                *(Drift.Trial() & key).fetch('onset', 'offset', 'direction')):
+            dir_index = (unique_directions == direction).nonzero()[0][0]
+            t0 = frame_times - onset
+            t1 = frame_times - offset
+            regressors[:, dir_index] += (
+                    (t0 > 0) * (1 - np.exp(-np.maximum(0, t0 / tau))) -
+                    (t1 > 0) * (1 - np.exp(-np.maximum(0, t1 / tau))))
+        self.insert1(dict(key, tau=tau, regressors=regressors))
+
+
+@schema
+class OriMap(dj.Computed):
+    definition = """
+    # Pixelwise orientation response map
+    -> CaMovie
+    -> OriDesign
+    ---
+    response_map  :  longblob   # pixelwise normalized response
+    activity_map  :  longblob   # root of sum of squares
+    """
+
+    def make(self, key):
+        # get movie
+        scan, scale = (CaMovie & key).fetch1('corrected_scan', 'scale_factor')
+        scan = scan.astype(np.float32) * scale
+
+        # get regressors
+        X = (OriDesign() & key).fetch1('regressors')
+        pipe = (fuse.MotionCorrection() & key).module
+        nfields_name = 'nfields/nrois' if 'nrois' in pipe.ScanInfo.heading else 'nfields'
+        nfields = int((pipe.ScanInfo & key).proj(n=nfields_name).fetch1('n'))
+        X = X[key['field'] - 1::nfields, :]
+
+        if abs(X.shape[0] - scan.shape[2]) > 1:
+            raise PipelineException('The sync frames do not match scan frames.')
+        else:
+            # truncate scan if X is shorter
+            if X.shape[0] < scan.shape[2]:
+                warn('Scan is longer than design matrix')
+                scan = scan[:, :, :X.shape[0]]
+            # truncate design matrix if scan is shorter
+            if scan.shape[2] < X.shape[0]:
+                warn('Scan is shorter than design matrix')
+                X = X[:scan.shape[2], :]
+
+        # limit the analysis to times when X is non-zero
+        ix = (X ** 2).sum(axis=1) > 1e-4 * (X ** 2).sum(axis=1).max()
+        X = X[ix, :]
+        scan = scan[:, :, ix]
+
+        # normalize regressors
+        X = X - X.mean(axis=0)
+        X /= np.sqrt((X ** 2).sum(axis=0, keepdims=True))
+
+        # normalize movie
+        scan -= scan.mean(axis=2, keepdims=True)
+        key['activity_map'] = np.sqrt((scan ** 2).sum(axis=2))
+        scan /= (key['activity_map'][:, :, None] + 1e-6)
+
+        # compute response
+        key['response_map'] = np.tensordot(scan, np.linalg.pinv(X), axes=(2, 1))
+        self.insert1(key)
+
+
+@schema
+class Cos2Map(dj.Computed):
+    definition = """
+    # Pixelwise orientation tuning map
+    -> OriMap
+    ---
+    direction_map  : longblob
+    amplitude_map  : longblob
+    """
+
+    def make(self, key):
+        u, r = (OriMap() * Drift() & key).fetch1('unique_directions', 'response_map')
+        assert all(u[1:] - u[:-1] == u[1] - u[0]) and (u[1] - u[0]) * u.size == 360, 'nonuniform directions'
+        cos2_vec = np.exp(2j * u * np.pi / 180) / np.sqrt(u.size / 2)
+        a = np.tensordot(r, cos2_vec, (2, 0))
+        self.insert1(dict(key, direction_map=np.angle(a / 2), amplitude_map=np.abs(a)))
+        self.notify(key)
+
+    def map(self, key):
+        import matplotlib.colors as mcolors
+
+        a, m = (Cos2Map & key).fetch1('direction_map', 'amplitude_map')
+        h = (a / np.pi / 2) % 1
+        v = np.minimum(m ** 2 / 0.05, 1)
+        s = np.minimum(m / 0.1, 1)
+        return mcolors.hsv_to_rgb(np.stack((h, s, v), axis=2))
+
+    def save(self, path='.'):
+        import matplotlib.image as mpimg
+
+        for key in self.fetch(dj.key):
+            im = self.map(key)
+            filename = '_'.join('%s-%s' % (k, v) for k, v in key.items())
+            filename = os.path.join(path, filename)
+            mpimg.imsave(filename + '.png', im)
+
+    @notify.ignore_exceptions
+    def notify(self, key):
+        import seaborn as sns
+        import matplotlib.pyplot as plt
+        img_filename = '/tmp/' + key_hash(key) + '.png'
+        im = self.map(key)
+        amap = (self & key).fetch1('amplitude_map') ** 2
+        pmap = np.interp(amap, amap.ravel()[np.argsort(amap.ravel())], np.linspace(0, 100, amap.size))
+
+        with sns.axes_style('white'):
+            title = 'pixelwise orientation for {animal_id}-{session}-{scan_idx} field {field}'.format(**key)
+            fig = plt.figure(figsize=(15, 15))
+            if im.shape[0] > im.shape[1]:
+                orientation = 'horizontal'
+                gs = plt.GridSpec(21, 2)
+                ax_ori = fig.add_subplot(gs[:-1, 0])
+                # cax_ori = fig.add_subplot(gs[-1, 0])
+                ax_r2 = fig.add_subplot(gs[:-1, 1])
+                cax_r2 = fig.add_subplot(gs[-1, 1])
+            else:
+                orientation = 'vertical'
+                gs = plt.GridSpec(2, 21)
+                ax_ori = fig.add_subplot(gs[0, :-1])
+                # cax_ori = fig.add_subplot(gs[0, -1])
+                ax_r2 = fig.add_subplot(gs[1, :-1])
+                cax_r2 = fig.add_subplot(gs[1, -1])
+
+            h = ax_ori.imshow(im, interpolation='nearest')
+            # fig.colorbar(h, cax=cax_ori, orientation=orientation)
+            h = ax_r2.matshow(pmap, cmap='coolwarm')
+            fig.colorbar(h, cax=cax_r2, orientation=orientation)
+            [a.axis('off') for a in [ax_ori, ax_r2]]
+            fig.tight_layout()
+            fig.subplots_adjust(top=0.9)
+            ax_ori.set_title('pixelwise orientation map')
+            ax_r2.set_title('percentile power (amplitude_map^2)')
+            fig.suptitle('{animal_id}-{session}-{scan_idx} field {field}'.format(**key))
+            fig.savefig(img_filename, dpi=200)
+            plt.close(fig)
+
+            (notify.SlackUser() & (experiment.Session() & key)).notify(
+                file=img_filename,
+                file_title=title,
+                channel='#pipeline_quality')
+            schema.spawn_missing_classes()
+
+
+@schema
+class OriMapQuality(dj.Computed):
+    definition = """
+    # Summary quality of pixelwise tuning
+    -> Cos2Map
+    ---
+    r2_9  : float  # 90th percentile of variance explained
+    r2_99 : float  # 99th percentile of variance explained
+    r2_999: float  # 99.9th percentile of variance explained
+    """
+
+    def make(self, key):
+        r2 = (Cos2Map & key).fetch1('amplitude_map') ** 2
+        self.insert1(dict(key,
+                          r2_9=np.nanpercentile(r2, 9),
+                          r2_99=np.nanpercentile(r2, 99),
+                          r2_999=np.nanpercentile(r2, 99.9)))
+
+
+@schema
+class Timeblock(dj.Lookup):
+    definition = """
+    percent_time :  tinyint    # percent time to include in analysis
+    """
+    contents = zip([25, 50, 100])
+
+
+@schema
+class TimeOriMap(dj.Computed):
+    definition = """
+    # Pixelwise orientation response map
+    -> CaTimes
+    -> OriDesign
+    -> Timeblock
+    ---
+    latency       : float  #  (s)
+    response_map  :  external-maps   # pixelwise normalized response
+    activity_map  :  external-maps   # root of sum of squares
+    cos2_map      :  external-maps   # complex-valued orientation map
+    """
+
+    def make(self, key):
+        # get movie
+        scan, scale = (CaMovie & key).fetch1('corrected_scan', 'scale_factor')
+        scan = scan.astype(np.float32) * scale
+
+        # get design matrix
+        latency = 0.100  # ms
+        pipe = (fuse.MotionCorrection & key).module
+        frame_times = (stimulus.Sync & key).fetch1('frame_times', squeeze=True) + latency
+        field_times = (CaTimes & key).fetch1('times')
+        X = interp1d(frame_times, (OriDesign & key).fetch1('regressors'),
+                     axis=0, bounds_error=False, fill_value=0)(field_times)
+
+        if X.shape[2] < scan.shape[2]:
+            warn("Scan is longer than recorded length. Truncated %d frames to %d." % (scan.shape[2], X.shape[2]))
+            scan = scan[:, :, :X.shape[2]]
+
+        # limit the analysis to times when X is non-zero
+        ix = (X ** 2).sum(axis=1) > 1e-4 * (X ** 2).sum(axis=1).max()
+        X = X[ix, :]
+        scan = scan[:, :, ix]
+
+        # limit time
+        max_index = X.shape[0] * key['percent_time'] // 100
+        X = X[:max_index, :]
+        scan = scan[:, :, :max_index]
+
+        # normalize regressors
+        X = X - X.mean(axis=0)
+        X /= np.sqrt((X ** 2).sum(axis=0, keepdims=True))
+
+        # normalize movie
+        scan -= scan.mean(axis=2, keepdims=True)
+        a = np.sqrt((scan ** 2).sum(axis=2))
+        scan /= (a[:, :, None] + 1e-6)
+
+        r = np.tensordot(scan, np.linalg.pinv(X), axes=(2, 1))
+        # compute response
+
+        u = (Drift & key).fetch1('unique_directions')
+        assert all(u[1:] - u[:-1] == u[1] - u[0]) and (u[1] - u[0]) * u.size == 360, 'nonuniform directions'
+        cos2_vec = np.exp(2j * u * np.pi / 180) / np.sqrt(u.size / 2)
+        cos2 = np.tensordot(r, cos2_vec, (2, 0))
+
+        self.insert1(dict(key, latency=latency, response_map=r, cos2_map=cos2, activity_map=a))
+
+
+@schema
+class XTrialMap(dj.Computed):
+    definition = """
+    # Pixelwise intertrial covariance map
+    -> CaMovie
+    -> CaTimes
+    ---
+    bandwidth  : decimal(4,2)     # (Hz)
+    latency    : decimal(4,3)     # (s)
+    """
+
+    class TrialPair(dj.Part):
+        definition = """
+        # The pixelwise covariance map in a pair of trials with identical stimulus conditions
+        -> master
+        -> stimulus.Trial
+        (other_trial) -> stimulus.Trial(trial_idx)
+        ----
+        mu1        : external-analysis    # pixelwise map of mean activity in first trial
+        mu2        : external-analysis    # pixelwise map of mean activity in second trial
+        v1         : external-analysis    # pixelwise map of mean activity in first trial
+        v2         : external-analysis    # pixelwise map of mean activity in second trial
+        cov        : external-analysis    # pixelwise map of covariances (zero-based, not mean-based)
+        duration   : decimal(5,2)         # (s) trial duration
+        """
+
+    trial = (stimulus.Trial() * stimulus.Condition() &
+             'stimulus_type in ("stimulus.Trippy", "stimulus.Monet2", "stimulus.Clip", "stimulus.Varma", "stimulus.Matisse2")')
+
+    other = stimulus.Trial().proj('condition_hash', other_trial='trial_idx')
+    trial_pair = trial * other & 'other_trial > trial_idx'  # trials with repeated conditions
+
+    @property
+    def key_source(self):
+        return super().key_source & self.trial_pair
+
+    def make(self, key):
+        # get, convolve, and interpolate the scan
+        print('Loading movie:', key, flush=True)
+        scan, scale = (CaMovie & key).fetch1('corrected_scan', 'scale_factor')
+        ca_times = (CaTimes() & key).fetch1('times', squeeze=True)
+        scan = scan.astype(np.float32) * scale
+        ca_times = ca_times[:scan.shape[2]]  # truncate times
+        scan = scan[:, :, :ca_times.size]  # truncate scan
+        scani = interp1d(ca_times, scan, copy=False, assume_sorted=True)
+
+        # prepare convolution
+        latency = 0.08
+        bandwidth = 4.0
+        dt = (ca_times[1:] - ca_times[:-1]).mean()
+        n = round(1 / bandwidth / dt)
+        kernel_offsets = np.r_[-n:n + 1] * dt
+        kernel = np.hamming(kernel_offsets.size)
+        kernel = kernel / kernel.sum()
+        self.insert1(dict(key, latency=latency, bandwidth=bandwidth))
+
+        # compute inter-trial covariance
+        print('Computing pairs:', flush=True)
+        for pair_key in tqdm((self.trial_pair & key & 'other_trial > trial_idx').fetch("KEY")):
+            t1 = (stimulus.Trial() & pair_key).fetch1('flip_times', squeeze=True) + latency
+            other_key = {'trial_idx' if k == 'other_trial' else k: v for k, v in pair_key.items() if k != 'trial_idx'}
+            t2 = (stimulus.Trial() & other_key).fetch1('flip_times', squeeze=True) + latency
+            duration = t1[-1] - t1[0]
+            assert t1.size == t2.size and t1[0] < t2[0]
+            good_trial = np.abs((t1 - t1[0]) - (t2 - t2[0])).max() < 0.05
+            in_scan = ca_times[0] - kernel_offsets[0] <= t1[0] and t2[-1] <= ca_times[-1] - kernel_offsets[-1]
+            if good_trial and in_scan:
+                mu1 = np.zeros(scani.y.shape[0:2], dtype='float32')
+                mu2, v1, v2, cov = mu1.copy(), mu1.copy(), mu1.copy(), mu1.copy()
+                d = int(np.ceil((1 / (t1[1:] - t1[:-1]).mean() / bandwidth)))
+                for t, h in zip(kernel_offsets, kernel):
+                    s1 = scani(t1[d // 2::d] + t)
+                    s2 = scani(t2[d // 2::d] + t)
+                    mu1 += h * s1.mean(axis=2)
+                    mu2 += h * s2.mean(axis=2)
+                    v1 += h * (s1 ** 2).mean(axis=2)
+                    v2 += h * (s2 ** 2).mean(axis=2)
+                    cov += h * (s1 * s2).mean(axis=2)
+                self.TrialPair().insert1({
+                    **dict(mu1=mu1, mu2=mu2, v1=v1, v2=v2, cov=cov, duration=duration),
+                    **key, **pair_key},
+                    ignore_extra_fields=True)
+
+    def plot(self, path='.'):
+
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        from matplotlib import rcParams
+
+        rcParams['figure.dpi'] = 150
+        rcParams['figure.figsize'] = (20, 16)
+
+        def stim_corr_map(pairs):
+            if not pairs:
+                return None
+            mu1, mu2, v1, v2, cov, duration = [np.stack(r, axis=-1) for r in pairs.fetch(
+                'mu1', 'mu2', 'v1', 'v2', 'cov', 'duration')]
+            duration = duration.astype('float32')
+            duration /= duration.sum()
+            mu1 = np.dot(mu1, duration)
+            mu2 = np.dot(mu2, duration)
+            v1 = np.dot(v1, duration)
+            v2 = np.dot(v2, duration)
+            cov = np.dot(cov, duration)
+            eps = 1e-12
+            return (cov - mu1 * mu2) / np.sqrt((v1 - mu1 ** 2 + eps) * (v2 - mu2 ** 2 + eps))
+
+        for key in tqdm(self.fetch('KEY')):
+            print(key)
+            filename = os.path.join(path, '-'.join('%s=%s' % (k, v) for k, v in key.items()) + '.png')
+            if os.path.isfile(filename):
+                continue
+            pipe = (fuse.MotionCorrection & key).module
+            plt.clf()
+            key['channel'] = 1
+            if pipe.SummaryImages.Average & key:
+                avg = (pipe.SummaryImages.Average & key).fetch1('average_image')
+                plt.subplot(2, 3, 1)
+                plt.imshow(avg, cmap='gray')
+                plt.title('average')
+                plt.axis('off')
+
+            if pipe.SummaryImages.Correlation & key:
+                cor = (pipe.SummaryImages.Correlation & key).fetch1('correlation_image')
+                plt.subplot(2, 3, 2)
+                plt.imshow(cor, vmin=-1.0, vmax=1.0, cmap='PiYG')
+                plt.title('neighbor correlation')
+                plt.axis('off')
+
+            if Cos2Map & key:
+                plt.subplot(2, 3, 3)
+                a, m = (Cos2Map & key).fetch1('direction_map', 'amplitude_map')
+                h = (a / np.pi / 2) % 1
+                v = np.minimum(m ** 2 / 0.05, 1)
+                s = np.minimum(m / 0.1, 1)
+                im = mcolors.hsv_to_rgb(np.stack((h, s, v), axis=2))
+                plt.imshow(im)
+                plt.title('orientation response')
+                plt.axis('off')
+
+            ra = 0.5
+            i = 6
+            for stimulus_type in ('stimulus.Clip', 'stimulus.Monet2', 'stimulus.Monet',
+                                  'stimulus.Trippy', 'stimulus.Matisse2', 'stimulus.Varma'):
+                r = stim_corr_map(XTrialMap.TrialPair & key & (
+                        stimulus.Trial * stimulus.Condition() & dict(stimulus_type=stimulus_type)))
+                if r is not None:
+                    plt.subplot(2, 3, i)
+                    plt.imshow(r, vmin=-ra, vmax=ra, cmap='PiYG')
+                    plt.title(stimulus_type + ' signal corr')
+                    plt.axis('off')
+                    i -= 1
+
+            plt.suptitle('  '.join('%s=%s' % (k, v) for k, v in key.items()))
+            plt.savefig(filename)
+
+
+@schema
+class TrippyOpt(dj.Lookup):
+    definition = """
+    trippy_opt   : tinyint
+    ---
+    tau          : float       # (s) calcium time constant
+    latency      : float       # (s) screen-to-brain latency
+    spatial_blur : float       # (pixels)  sigma for 2D gaussian blur
+    downsample   : smallint    # (pixels) downsample factor
+    """
+    contents = [
+        dict(trippy_opt=0, downsample=24, spatial_blur=12, tau=0.7, latency=0.08),
+        dict(trippy_opt=1, downsample=30, spatial_blur=15, tau=0.8, latency=0.12),
+        dict(trippy_opt=2, downsample=30, spatial_blur=15, tau=1.0, latency=0.15)]
+
+
+@schema
+class TrippyDesign(dj.Computed):
+    definition = """
+    # Trippy design matrix
+    -> stimulus.Sync
+    -> TrippyOpt
+    ---
+    design       : external-maps  # x*y*flip_times complex-valued matrix
+    """
+
+    key_source = stimulus.Sync * TrippyOpt & (stimulus.Trial * stimulus.Trippy)
+
+    @staticmethod
+    def make_designs(key):
+        for trial_key in (stimulus.Trippy * stimulus.Trial & key).fetch('KEY'):
+            phase_movie, flip_times = (stimulus.TrippyPhase * stimulus.Trial & trial_key).fetch1(
+                'phase_movie', 'flip_times', squeeze=True)
+            tau, spatial_blur, downsample, latency = (TrippyOpt & key).fetch1(
+                'tau', 'spatial_blur', 'downsample', 'latency')
+            # spatial smoothing of orientation angles
+            dx, dy, _ = np.gradient(phase_movie)
+            r = dx + 1j * dy
+            design = abs(r) * np.exp(2j * np.angle(r))  # double the angle to convert direction to orientation
+            design /= np.maximum(abs(design), np.percentile(abs(design), 1))
+            smoothen = partial(filters.gaussian_filter, sigma=(spatial_blur, spatial_blur, 0))
+            smooth = smoothen(design.real) + 1j * smoothen(design.imag)
+            # convolve with calcium response and interpolate onto flip_times
+            dt = np.diff(flip_times).mean()
+            ntaps = np.ceil(1.6 * tau / dt)
+            t = np.r_[-ntaps:ntaps + 1] * dt
+            kernel = np.exp(-t / tau) * (t >= 0)
+            kernel = kernel / kernel.sum()
+            yield interp1d(
+                flip_times + latency,
+                signal.convolve(
+                    smooth[downsample // 3:-downsample // 6:downsample, downsample // 3:-downsample // 6:downsample, :],
+                    kernel[None, None, :], mode='same'), assume_sorted=True, bounds_error=False, fill_value=0.0)
+
+    def make(self, key):
+        frame_times = (stimulus.Sync & key).fetch1('frame_times', squeeze=True)
+        self.insert1(dict(
+            key,
+            design=np.sum(trial_design(frame_times).astype('complex64') for trial_design in self.make_designs(key))))
+
+
+@schema
+class TrippyMap(dj.Computed):
+    definition = """
+    # Pixelwise orientation response map
+    -> CaTimes
+    -> TrippyDesign
+    ---
+    response_map  :  external-maps   # pixelwise normalized response
+    activity_map  :  external-maps   # root of sum of squares
+    """
+
+    def make(self, key):
+        # get movie
+        scan, scale = (CaMovie & key).fetch1('corrected_scan', 'scale_factor')
+        scan = scan.astype(np.float32) * scale
+
+        # get design matrix
+        pipe = (fuse.MotionCorrection & key).module
+        frame_times = (stimulus.Sync & key).fetch1('frame_times', squeeze=True)
+        field_times = (CaTimes & key).fetch1('times')
+        X = interp1d(frame_times, (TrippyDesign & key).fetch1('design'),
+                     axis=2, bounds_error=False, fill_value=0)(field_times)
+
+        if X.shape[2] < scan.shape[2]:
+            warn("Scan is longer than recorded length. Truncated %d frames to %d." % (scan.shape[2], X.shape[2]))
+            scan = scan[:, :, :X.shape[2]]
+
+        print('field:', key['field'], 'X.shape:', X.shape, 'scan.shape:', scan.shape, flush=True)
+
+        # limit the analysis to times when X is non-zero
+        xsum = abs(X).sum(axis=(0,1))
+        ix = xsum > 1e-4*xsum.max()
+        X = X[:, :, ix]
+
+        scan = scan[:, :, ix[:scan.shape[2]]]
+
+        # normalize design matrix
+        bias = X.mean(axis=2, keepdims=True)
+        X -= bias
+        mag = np.sqrt((abs(X)**2).sum(axis=2))
+        X /= mag[:, :, None]
+
+        # normalize movie
+        scan -= scan.mean(axis=2, keepdims=True)
+        activity = np.sqrt((scan ** 2).sum(axis=2))
+        scan /= activity[:, :, None] + 1e-6
+
+        # invert and fit
+        Xinv = np.linalg.pinv(np.reshape(X, [X.shape[0] * X.shape[1], X.shape[2]]))
+        self.insert1(dict(
+            key,
+            activity_map=activity,
+            response_map=np.reshape(
+                np.tensordot(scan, Xinv, axes=(2, 0)),
+                (scan.shape[0], scan.shape[1], X.shape[0], X.shape[1]))))
+
+
+@schema
+class Response(dj.Computed):
+    definition = """  # cell-wise response to directional stimulus
+    -> fuse.Activity
+    -> Drift
+    ---
+    latency : float   # latency used (ms)
+    """
+
+    class Trial(dj.Part):
+        definition = """   # the response for each trial and each trace
+        -> Response
+        -> fuse.Activity.Trace
+        -> Drift.Trial
+        ---
+        response : float   #  integrated response
+        """
+
+    def make(self, key):
+        pipe = (fuse.MotionCorrection() & key).module
+        traces, delay, trace_keys = (pipe.Activity.Trace() * pipe.ScanSet.UnitInfo() & key).fetch(
+            'trace', 'ms_delay', dj.key)
+        delay = delay / 1000  # seconds
+        traces = np.stack(t.flatten() for t in traces).astype('float64')
+        assert traces.ndim == 2 and traces.shape[0] == len(trace_keys), 'incorrect trace dimensions'
+
+        #  fetch and clean up the trace time
+        trace_time = (stimulus.Sync() & key).fetch1('frame_times').squeeze()  # calcium scan frame times
+        nfields_name = 'nfields/nrois' if 'nrois' in pipe.ScanInfo.heading else 'nfields'
+        nfields = int((pipe.ScanInfo & key).proj(n=nfields_name).fetch1('n'))
+        trace_time = trace_time[:nfields * traces.shape[1]:nfields]  # keep first field, truncate interrupted scans
+
+        # compute responses
+        latency = 0.02  # s
+        self.insert1(dict(key, latency=1000 * latency))
+        traces = [interp1d(trace_time - d - latency, np.cumsum(t)) for d, t in zip(delay, traces)]
+        self.Trial().insert(
+            {**trial_key, **k, **key, 'response': t(offset) - t(onset)}
+            for t, k in zip(traces, trace_keys)
+            for onset, offset, trial_key in zip(*(Drift.Trial & key).fetch('onset', 'offset', dj.key)))
+
+
+@schema
+class OracleMap(dj.Computed):
+    definition = """
+    # Pixelwise oracle map
+    -> fuse.MotionCorrection
+    ---
+    -> shared.Channel
+    oracle      :  float      # average oracle value
+    oracle_map  :  longblob   # pixelwise correlation values
+    p_map       :  longblob   # pixel p-value
+    """
+
+    def load(self, key):
+        from pipeline.utils import galvo_corrections
+
+        # load
+        print('Loading scan', flush=True)
+        reader = scanreader.read_scan((experiment.Scan() & key).local_filenames_as_wildcard)
+        scan = reader[key['field'] - 1, :, :, key['channel'] - 1].astype(np.float32)
+
+        # raster correction
+        print('Raster correction', flush=True)
+        pipe = (fuse.MotionCorrection() & key).module
+        raster_phase = (pipe.RasterCorrection() & key).fetch1('raster_phase')
+        fill_fraction = (pipe.ScanInfo() & key).fetch1('fill_fraction')
+        scan = galvo_corrections.correct_raster(scan, raster_phase, fill_fraction)
+
+        # motion correction
+        print('Motion correction', flush=True)
+        y_shifts, x_shifts = (pipe.MotionCorrection() & key).fetch1('y_shifts', 'x_shifts')
+        scan = galvo_corrections.correct_motion(scan, np.stack([x_shifts, y_shifts]))
+
+        return scan, reader.num_scanning_depths
+
+    @property
+    def key_source(self):
+        rel2 = (stimulus.Clip() * fuse.MotionCorrection() * stimulus.Movie() \
+                & 'movie_class in ("cinema", "youtube", "unreal")').aggr(
+            stimulus.Trial(), repeats="count(movie_name)")
+        return fuse.MotionCorrection() & stimulus.Sync() & (rel2 & 'repeats > 2').proj()
+
+    def make(self, key):
+        print('Populating\n', pformat(key, indent=10))
+        repeats = stimulus.Clip().aggr(stimulus.Trial() & key, repeats='count(movie_name)') & 'repeats > 2'
+        if experiment.Session.PMTFilterSet() & key & {'pmt_filter_set': '3P1 green-THG'}:
+            key['channel'] = 2
+        else:
+            key['channel'] = 1
+        scan, ndepths = self.load(key)
+
+        frame_times = (stimulus.Sync() & key).fetch1('frame_times').squeeze()
+        frame_times = frame_times[key['field'] - 1::ndepths]
+
+        ft_min = frame_times.min()
+        frame_times = frame_times - ft_min
+
+        if 0 <= np.abs(frame_times.size - scan.shape[-1]) < 20:
+            print('Shortening length of frametimes and scan to the same size')
+            ml = min(frame_times.size, scan.shape[-1])
+            scan = scan[..., :ml]
+            frame_times = frame_times[:ml]
+        else:
+            raise ValueError('Difference in frametimes and scan length greater 20 frames')
+
+        downsample_to = 0.250  # 4 Hz
+        h = np.hamming(2 * int(downsample_to // np.median(np.diff(frame_times))) + 1).astype(np.float32)
+        h /= h.sum()
+
+        oracles, data, data_shuffle = [], [], []
+        *spatial_dim, T = scan.shape
+        scan = scan.reshape((-1, T))
+        # permute = lambda x: x[np.random.permutation(len(x))]
+        for condition in (dj.U('condition_hash') & repeats).fetch(dj.key):
+            # --- load fliptimes
+            trial_keys, flip_times = (stimulus.Trial() & key & condition).fetch(dj.key, 'flip_times')
+            l = np.min([ft.size for ft in flip_times])
+            flip_times = [ft.squeeze()[:l] - ft_min for ft in flip_times]
+            flip_times = [np.arange(ft.min(), ft.max(), downsample_to) for ft in flip_times]  # downsample to 4 Hz
+
+            # --- smooth trial, subsample, compute mean
+            movs = []
+            for ft in tqdm(flip_times, desc='Trial: '):
+                movs.append(
+                    np.vstack([np.interp(ft, frame_times, np.convolve(px, h, mode='same'))
+                               for px in scan]).reshape(tuple(spatial_dim) + (len(ft),))
+                )
+            mov = np.stack(movs, axis=0)
+            mu = mov.mean(axis=0, keepdims=True)
+
+            r, *_, t = mov.shape
+            oracle = (mu - mov / r) * r / (r - 1)
+            spatial_dim = tuple(spatial_dim)
+            oracles.append(oracle.transpose([0, 3, 1, 2]).astype(np.float32))
+            data.append(mov.transpose([0, 3, 1, 2]).astype(np.float32))
+        key['oracle_map'], key['p_map'] = \
+            corr(np.concatenate(data, axis=0), np.concatenate(oracles, axis=0), axis=(0, 1), return_p=True)
+        key['oracle'] = key['oracle_map'].mean()
+        self.insert1(key)
+        self.notify(key)
+
+    @notify.ignore_exceptions
+    def notify(self, key):
+        import seaborn as sns
+        import matplotlib.pyplot as plt
+        img_filename = '/tmp/' + key_hash(key) + '.png'
+        m, p = key['oracle_map'], key['p_map']
+        cmap = sns.blend_palette(['dodgerblue', 'steelblue', 'k', 'lime', 'yellow'], as_cmap=True)
+        with sns.axes_style('white'):
+            title = 'oracle image for {animal_id}-{session}-{scan_idx} field {field}'.format(**key)
+            fig = plt.figure(figsize=(15, 15))
+            if m.shape[0] > m.shape[1]:
+                orientation = 'horizontal'
+                gs = plt.GridSpec(21, 2)
+                ax_corr = fig.add_subplot(gs[:-1, 0])
+                cax_corr = fig.add_subplot(gs[-1, 0])
+                ax_p = fig.add_subplot(gs[:-1, 1])
+                cax_p = fig.add_subplot(gs[-1, 1])
+            else:
+                orientation = 'vertical'
+                gs = plt.GridSpec(2, 21)
+                ax_corr = fig.add_subplot(gs[0, :-1])
+                cax_corr = fig.add_subplot(gs[0, -1])
+                ax_p = fig.add_subplot(gs[1, :-1])
+                cax_p = fig.add_subplot(gs[1, -1])
+
+            # v = np.abs(m).max()
+            h = ax_corr.imshow(m, vmin=-1, vmax=1, cmap=cmap)
+            fig.colorbar(h, cax=cax_corr, orientation=orientation)
+
+            h = ax_p.matshow(np.log(p / p.size), cmap='coolwarm_r')
+            # fig.colorbar(h, cax=cax_p, orientation=orientation)
+            [a.axis('off') for a in [ax_corr, ax_p]]
+            fig.tight_layout()
+            fig.subplots_adjust(top=0.9)
+            ax_corr.set_title('oracle correlation map')
+            ax_p.set_title('log p-value (incorrect DF)')
+            fig.suptitle('{animal_id}-{session}-{scan_idx} field {field}'.format(**key))
+            fig.savefig(img_filename, dpi=200)
+            plt.close(fig)
+
+            (notify.SlackUser() & (experiment.Session() & key)).notify(file=img_filename,
+                                                                       file_title=title,
+                                                                       channel='#pipeline_quality')
+            schema.spawn_missing_classes()
+
+
+class TraceMixin:
+
+    def load_traces_and_frametimes(self, key):
+        # -- find number of recording depths
+        pipe = (fuse.Activity() & key).module
+        k = dict(key)
+        k.pop('field')
+        ndepth = len(dj.U('z') & (pipe.ScanInfo.Field() & k))
+        frame_times = (stimulus.Sync() & key).fetch1('frame_times').squeeze()[::ndepth]
+
+        soma = pipe.MaskClassification.Type() & dict(type='soma')
+
+        spikes = (dj.U('field', 'channel') * pipe.Activity.Trace() * pipe.ScanSet.Unit()
+                  * pipe.ScanSet.UnitInfo() & soma & key)
+        traces, ms_delay, trace_keys = spikes.fetch('trace', 'ms_delay', dj.key)
+        delay = np.fromiter(ms_delay / 1000, dtype=np.float)
+        frame_times = (delay[:, None] + frame_times[None, :])
+        traces = np.vstack([fill_nans(tr.astype(np.float32)).squeeze() for tr in traces])
+        traces, frame_times = self.adjust_trace_len(traces, frame_times)
+        return traces, frame_times, trace_keys
+
+    def adjust_trace_len(self, traces, frame_times):
+        trace_len, nframes = traces.shape[1], frame_times.shape[1]
+        if trace_len < nframes:
+            frame_times = frame_times[:, :trace_len]
+        elif trace_len > nframes:
+            traces = traces[:, :nframes]
+        return traces, frame_times
+
+    def get_trace_spline(self, key, bandwidth=4.0):
+        traces, frame_times, trace_keys = self.load_traces_and_frametimes(key)
+        duration = 1 / bandwidth
+        sampling_period = np.median(np.diff(frame_times))
+        if duration < sampling_period:
+            warn('Target sampling period < source sampling period! Returning identity.')
+            h = np.ones(1)
+        else:
+            h = np.hamming(2 * int(duration // sampling_period) + 1)
+            h /= h.sum()
+
+        # low pass filter
+        trace_spline = SplineCurve(frame_times,
+                                   [np.convolve(trace, h, mode='same') for trace in traces], k=1, ext=1)
+        return trace_spline, trace_keys, frame_times.min(), frame_times.max()
+
+
+class OracleMixin:
+    _baseclass = None
+
+    @property
+    def key_source(self):
+        return fuse.Activity() & stimulus.Sync() & self.repeated_clips.proj()
+
+    @property
+    def repeated_clips(self):
+        return (self._baseclass() * fuse.Activity()).aggr(
+            fuse.Activity().proj() * self._baseclass().proj() * stimulus.Trial(),
+            repeats="count(condition_hash)") & 'repeats > 2'
+
+    def make(self, key):
+        self.insert1(key)
+        trace_spline, trace_keys, ftmin, ftmax = self.get_trace_spline(key)
+        for clip_key in (self.repeated_clips & key).fetch.keys():
+            frame_rate = float((self._baseclass() & clip_key).fetch1('fps'))
+            flip_times = (stimulus.Trial() * self._baseclass() & clip_key).fetch('flip_times')
+
+            # --- check for dropped frames
+            no_drop = np.array([np.diff(ft).max() < 1.99 / frame_rate for ft in flip_times], dtype=bool)
+
+            if np.any(~no_drop):
+                print('Found dropped frames in {} trials. Excluding them.'.format((~no_drop).sum()))
+
+            # --- check for trials outside recording
+            inside = np.array([(ft.min() >= ftmin) & (ft.max() <= ftmax) for ft in flip_times], dtype=bool)
+            if np.any(~inside):
+                print('Found {} trials outside recording. Exclusing them.'.format((~inside).sum()))
+
+            trials = (no_drop & inside).sum()
+            if trials < 4:
+                print('To few trials left. Excluding that clip.')
+                continue
+            flip_times = flip_times[no_drop & inside]
+            responses = np.stack([trace_spline(ft) for ft in flip_times], axis=0)
+
+            mu = responses.mean(axis=0, keepdims=True)
+            oracle = (mu - responses / trials) * trials / (trials - 1)
+            pearson = corr(responses, oracle, axis=-1).mean(axis=0)
+
+            self.Pearson().insert(dict(clip_key, **k, pearson=p, trials=trials) for k, p in zip(trace_keys, pearson))
+
+
+@schema
+class MovieOracle(dj.Computed, TraceMixin):
+    definition = """
+    # oracle for repeated videos
+    -> fuse.Activity
+    -> stimulus.Sync
+    ---
+    """
+
+    class Pearson(dj.Part):
+        definition = """
+        -> master
+        -> fuse.Activity.Trace
+        -> stimulus.Clip
+        ---
+        trials      : int    # number of trials used
+        pearson     : float  # per unit oracle pearson correlation over all movies
+        """
+
+    @property
+    def key_source(self):
+        return fuse.Activity() & stimulus.Sync() & self.repeated_clips.proj()
+
+    @property
+    def repeated_clips(self):
+        return (stimulus.Clip() * fuse.Activity()).aggr(
+            fuse.Activity().proj() * stimulus.Clip().proj() * stimulus.Trial() * stimulus.Movie()
+            & 'movie_class in ("cinema", "youtube", "unreal")', repeats="count(movie_name)") & 'repeats > 2'
+
+    def make(self, key):
+        self.insert1(key)
+        trace_spline, trace_keys, ftmin, ftmax = self.get_trace_spline(key)
+        for clip_key in (self.repeated_clips & key).fetch.keys():
+            frame_rate = float((stimulus.Monet() & clip_key).fetch1('fps'))
+            flip_times = (stimulus.Trial() & clip_key).fetch('flip_times')
+
+            # --- check for dropped frames
+            no_drop = np.array([np.diff(ft).max() < 1.99 / frame_rate for ft in flip_times], dtype=bool)
+            if np.any(~no_drop):
+                print('Found dropped frames in {} trials. Exclusing them.'.format((~no_drop).sum()))
+
+            # --- check for trials outside recording
+            inside = np.array([(ft.min() >= ftmin) & (ft.max() <= ftmax) for ft in flip_times], dtype=bool)
+            if np.any(~inside):
+                print('Found {} trials outside recording. Exclusing them.'.format((~inside).sum()))
+
+            trials = (no_drop & inside).sum()
+            if trials < 4:
+                print('To few trials left. Excluding that clip.')
+                continue
+            flip_times = flip_times[no_drop & inside]
+            responses = np.stack([trace_spline(ft) for ft in flip_times], axis=0)
+
+            mu = responses.mean(axis=0, keepdims=True)
+            oracle = (mu - responses / trials) * trials / (trials - 1)
+            pearson = corr(responses, oracle, axis=-1).mean(axis=0)
+
+            self.Pearson().insert(dict(clip_key, **k, pearson=p, trials=trials) for k, p in zip(trace_keys, pearson))
+
+
+@schema
+class StimulusType(dj.Lookup):
+    definition = """
+    # class names from the stimulus schema
+    stimulus_type : varchar(30)
+    """
+    contents = (dj.U('stimulus_type') & stimulus.Condition()).fetch()
+
+
+@schema
+class STA(dj.Computed, TraceMixin):
+    definition = """
+    # Spike-triggered average receptive field maps
+    -> fuse.Activity
+    -> stimulus.Sync
+    -> StimulusType
+    ---
+    nbins            : tinyint        # number of bins
+    bin_size         : decimal(3,3)   # (s)
+    total_duration   : decimal(6,2)   # total duration of included trials
+    vmax             : float          # correlation value of int8 level at 127
+    """
+
+    class Map(dj.Part):
+        definition = """
+        # receptive field map
+        -> master
+        -> fuse.Activity.Trace
+        ---
+        map  : external-map  #  receptive field map
+        """
+
+    conditions = {
+        'stimulus.Monet': stimulus.Monet,
+        'stimulus.Monet2': stimulus.Monet2,
+        'stimulus.Trippy': stimulus.Trippy,
+        'stimulus.Varma': stimulus.Varma}
+
+    @staticmethod
+    def sta(snippets, movie):
+        """spike-triggered average"""
+        nbins = movie.shape[2] - snippets.shape[1] + 1
+        return np.stack((np.tensordot(snippets, movie[:, :, rf_bin:rf_bin + snippets.shape[1]], axes=(1, 2))
+                         for rf_bin in reversed(range(nbins))), 3) / snippets.shape[1]
+
+    @property
+    def key_source(self):
+        return (super().key_source &
+                "stimulus_type in ({conds})".format(conds=','.join("'%s'" % r for r in self.conditions)) &
+                stimulus.Trial() * stimulus.Condition())
+
+    def plot(self, path='.', vmax=65):
+        import matplotlib.pyplot as plt
+        from matplotlib import rcParams
+        rcParams['figure.figsize'] = (20, 16)
+        rcParams['figure.dpi'] = 150
+        for key in tqdm(self.fetch('KEY')):
+            plt.clf()
+            total_duration = int((STA & key).fetch1('total_duration'))
+            maps = (STA.Map & key).fetch('map')
+            n = len(maps)
+            for i, m in enumerate(maps):
+                plt.subplot(np.ceil(np.sqrt(n)), np.ceil(np.sqrt(n)), i + 1)
+                plt.imshow(m[:, :, 0:3].mean(axis=2), vmin=-vmax, vmax=vmax, cmap='seismic')
+                plt.axis('off')
+            plt.suptitle('  '.join('{k}:{v}'.format(k=k, v=v) for k, v in key.items() if k.startswith(
+                ('an', 'sc', 'ses', 'stim', 'fi', 'seg', 'spi'))) +
+                         '  Stimulus duration {total_duration} s.'.format(total_duration=total_duration))
+            plt.savefig(os.path.join(path, 'RF' + '-'.join('{k}_{v}'.format(k=k, v=v) for k, v in key.items())) + '.png')
+
+    def make(self, key):
+        nbins = 5
+        bin_size = 0.1
+        trace_spline, trace_keys, ftmin, ftmax = self.get_trace_spline(key, 1 / bin_size)
+        movie_table = self.conditions[key['stimulus_type']]()
+        total_duration = maps = trace_norm = movie_mean = movie_var = 0.0
+        trace_mean = trace_var = 0.0
+        loop = (stimulus.Trial * stimulus.Condition() & key).fetch("KEY", 'flip_times', squeeze=True)
+
+        for trial_key, flip_times in zip(*loop):
+
+            # align times
+            start_time = np.maximum(flip_times[0], ftmin - bin_size * (nbins - 1)) + bin_size / 2
+            end_time = np.minimum(flip_times[-1], ftmax) - bin_size / 2
+            if end_time - start_time < 3.0:
+                continue
+            movie_time = np.r_[start_time:end_time:bin_size]
+            trace_time = movie_time[nbins - 1:]
+            duration = trace_time[-1] - trace_time[0] + bin_size
+            if duration < 3.0:
+                continue
+            total_duration += duration
+
+            # interpolate movie
+            movie = (movie_table & trial_key).fetch1('movie').astype('float32') / 127.5 - 1
+            if movie.ndim == 4:  # ignore color
+                movie = movie.sum(axis=2) / np.sqrt(2)
+            movie = interp1d(flip_times, movie)(movie_time)
+
+            # interpolate traces
+            snippets = trace_spline(trace_time)
+            trace_mean += snippets.mean(axis=1) * duration
+            trace_var += (snippets ** 2).mean(axis=1) * duration
+
+            # update maps
+            maps += self.sta(snippets, movie) * duration
+            ones = np.ones((1, trace_time.size))
+            movie_mean += self.sta(ones, movie) * duration
+            movie_var += self.sta(ones, movie ** 2) * duration
+
+        # normalize as correlation
+        xy = maps / total_duration
+        xx = movie_var / total_duration
+        mx = movie_mean / total_duration
+        yy = trace_var[:, None, None, None] / total_duration
+        my = trace_mean[:, None, None, None] / total_duration
+        g = (xy - mx * my) / np.sqrt((xx - mx ** 2) * (yy - my ** 2))
+        vmax = 0.4
+        g = np.int8(np.clip(127 * g / vmax, -128, 127))
+
+        self.insert1(dict(key, vmax=vmax, nbins=nbins, bin_size=bin_size, total_duration=total_duration))
+        self.Map().insert((dict(key, map=rf, **trace_key) for trace_key, rf in zip(trace_keys, g)),
+                          ignore_extra_fields=True)
+
+
+@schema
+class STAQual(dj.Computed):
+    definition = """
+    -> STA.Map
+    ---
+    snr : float  # RF contrast measurement
+    """
+
+    key_source = STA & STA.Map
+
+    def make(self, key):
+        self.insert(dict(k, snr=abs(m[:, :, 1]).max() / m.std())
+                    for k, m in zip(*(STA.Map & key).fetch('KEY', 'map')))
+
+
+@schema
+class TimedSTA(dj.Computed, TraceMixin):
+    definition = """
+    # Spike-triggered average receptive field maps
+    -> fuse.Activity
+    -> stimulus.Sync
+    -> StimulusType
+    -> Timeblock
+    ---
+    nbins            : tinyint        # number of bins
+    bin_size         : decimal(3,3)   # (s)
+    total_duration   : decimal(6,2)   # total duration of included trials
+    vmax             : float          # correlation value of int8 level at 127
+    """
+
+    class Map(dj.Part):
+        definition = """
+        # receptive field map
+        -> master
+        -> fuse.Activity.Trace
+        ---
+        map  : longblob  #  receptive field map
+        """
+
+    conditions = {
+        'stimulus.Monet': stimulus.Monet,
+        'stimulus.Monet2': stimulus.Monet2,
+        'stimulus.Trippy': stimulus.Trippy,
+        'stimulus.Varma': stimulus.Varma}
+
+    @staticmethod
+    def sta(snippets, movie):
+        """spike-triggered average"""
+        nbins = movie.shape[2] - snippets.shape[1] + 1
+        return np.stack((np.tensordot(snippets, movie[:, :, rf_bin:rf_bin + snippets.shape[1]], axes=(1, 2))
+                         for rf_bin in reversed(range(nbins))), 3) / snippets.shape[1]
+
+    @property
+    def key_source(self):
+        return (super().key_source &
+                "stimulus_type in ({conds})".format(conds=','.join("'%s'" % r for r in self.conditions)) &
+                stimulus.Trial() * stimulus.Condition())
+
+    def plot(self, path='.', vmax=65):
+        from matplotlib import pyplot as plt
+        from matplotlib import rcParams
+        rcParams['figure.figsize'] = (20, 16)
+        rcParams['figure.dpi'] = 150
+        for key in tqdm(self.fetch('KEY')):
+            plt.clf()
+            total_duration = int((STA & key).fetch1('total_duration'))
+            maps = (STA.Map & key).fetch('map')
+            n = len(maps)
+            for i, m in enumerate(maps):
+                plt.subplot(np.ceil(np.sqrt(n)), np.ceil(np.sqrt(n)), i + 1)
+                plt.imshow(m[:, :, 0:3].mean(axis=2), vmin=-vmax, vmax=vmax, cmap='seismic')
+                plt.axis('off')
+            plt.suptitle('  '.join('{k}:{v}'.format(k=k, v=v) for k, v in key.items() if k.startswith(
+                ('an', 'sc', 'ses', 'stim', 'fi', 'seg', 'spi'))) +
+                         '  Stimulus duration {total_duration} s.'.format(total_duration=total_duration))
+            plt.savefig(os.path.join(path, 'RF' + '-'.join('{k}_{v}'.format(k=k, v=v) for k, v in key.items())) + '.png')
+
+    def make(self, key):
+        nbins = 5
+        bin_size = 0.1
+        trace_spline, trace_keys, ftmin, ftmax = self.get_trace_spline(key, 1 / bin_size)
+        movie_table = self.conditions[key['stimulus_type']]()
+        total_duration = maps = trace_norm = movie_mean = movie_var = 0.0
+        trace_mean = trace_var = 0.0
+        trials = stimulus.Trial * stimulus.Condition & key
+        ntrials = int((len(trials) * key['percent_time'] + 0.5) / 100)
+        loop = trials.fetch("KEY", 'flip_times', squeeze=True, limit=ntrials)
+
+        for trial_key, flip_times in zip(*loop):
+
+            # align times
+            start_time = np.maximum(flip_times[0], ftmin - bin_size * (nbins - 1)) + bin_size / 2
+            end_time = np.minimum(flip_times[-1], ftmax) - bin_size / 2
+            if end_time - start_time < 3.0:
+                continue
+            movie_time = np.r_[start_time:end_time:bin_size]
+            trace_time = movie_time[nbins - 1:]
+            duration = trace_time[-1] - trace_time[0] + bin_size
+            if duration < 3.0:
+                continue
+            total_duration += duration
+
+            # interpolate movie
+            movie = (movie_table & trial_key).fetch1('movie').astype('float32') / 127.5 - 1
+            if movie.ndim == 4:  # ignore color
+                movie = movie.sum(axis=2) / np.sqrt(2)
+            movie = interp1d(flip_times, movie)(movie_time)
+
+            # interpolate traces
+            snippets = trace_spline(trace_time)
+            trace_mean += snippets.mean(axis=1) * duration
+            trace_var += (snippets ** 2).mean(axis=1) * duration
+
+            # update maps
+            maps += self.sta(snippets, movie) * duration
+            ones = np.ones((1, trace_time.size))
+            movie_mean += self.sta(ones, movie) * duration
+            movie_var += self.sta(ones, movie ** 2) * duration
+
+        # normalize as correlation
+        xy = maps / total_duration
+        xx = movie_var / total_duration
+        mx = movie_mean / total_duration
+        yy = trace_var[:, None, None, None] / total_duration
+        my = trace_mean[:, None, None, None] / total_duration
+        g = (xy - mx * my) / np.sqrt((xx - mx ** 2) * (yy - my ** 2))
+        vmax = 0.4
+        g = np.int8(np.clip(127 * g / vmax, -128, 127))
+
+        self.insert1(dict(key, vmax=vmax, nbins=nbins, bin_size=bin_size, total_duration=total_duration))
+        self.Map().insert((dict(key, map=rf, **trace_key) for trace_key, rf in zip(trace_keys, g)),
+                          ignore_extra_fields=True)
+
+
+@schema
+class TimedSTAQual(dj.Computed):
+    definition = """
+    -> TimedSTA.Map
+    ---
+    snr : float  # RF contrast measurement
+    """
+
+    key_source = STA & STA.Map
+
+    def make(self, key):
+        self.insert(dict(k, snr=abs(m[:, :, 1]).max() / m.std())
+                    for k, m in zip(*(STA.Map & key).fetch('KEY', 'map')))
+
+
+@schema
+class StellarOption(dj.Lookup):
+    definition = """
+    stellar :  tinyint   # stellar mapping analysis option
+    ---
+    trial_mean  : enum('arithmetic', 'geometric')  # the type of mean to apply to trials of the same condition
+    ca_tau : float   #  (s)
+    latency : float   # (s)
+    trippy_spatial_blur : float          # (pixels)  sigma for trippy 2D gaussian blur
+    trippy_downsample   : smallint       # (pixels) downsample factor
+    """
+
+    contents = [
+        [0, 'arithmetic', 0.7, 0.05, 15.0, 30],
+        [1, 'geometric', 0.7, 0.05, 15.0, 30],
+        [2, 'arithmetic', 1.3, 0.05, 15.0, 30],
+        [3, 'geometric', 1.3, 0.05, 15.0, 30],
+        [5, 'geometric', 0.7, 0.05, 8.0, 16]]
+
+
+@schema
+class StellarMap(dj.Computed):
+    definition = """
+    -> CaTimes
+    -> CaMovie
+    -> StellarOption
+    """
+
+    class Condition(dj.Part):
+        definition = """
+        -> master
+        -> stimulus.Condition
+        ---
+        design_m1      : longblob    # 1-moment complex-valued
+        design_m2      : longblob    # 2-moment real-valued
+        response_m1    : external-analysis    # 1-moment of scan after trial averaging
+        response_m2    : external-analysis    # 2-moment of scan after trial averaging
+        xcov           : external-analysis    # complex-valued zero-mean cross-covariance of design and response after trial averaging
+        duration            : float    # (s) trial duration
+        ntrials             : smallint # number of valid trials
+        """
+
+    def make(self, key):
+        avg = dict(
+            geometric=lambda x, y: np.sqrt(x * y),
+            arithmetic=lambda x, y: (x + y) / 2)
+        opt = (StellarOption & key).fetch1()
+        scan, scale = (CaMovie & key).fetch1('corrected_scan', 'scale_factor')
+        scan = scan.astype(np.float32) * scale
+        field_times = (CaTimes & key).fetch1('times')
+        if field_times.size > scan.shape[2]:
+            warn('Truncated scan!')
+            field_times = field_times[:scan.shape[2]]
+        scani = interp1d(field_times - opt['latency'], scan, copy=False, assume_sorted=True)  # movie on stimulus time
+        self.insert1(key)
+
+        for condition in stimulus.Condition & (stimulus.Trial & key & [stimulus.Monet2, stimulus.Trippy]):
+            flip_times = (stimulus.Trial & condition & key).fetch('flip_times', squeeze=True)
+            passed = len(flip_times) == 2
+            passed = passed and all(t[0] > scani.x[0] and t[-1] < scani.x[-1] for t in flip_times)
+            passed = passed and abs(np.diff(flip_times[0] - flip_times[1])).max() < 0.01
+            if not passed:
+                continue
+
+            # align scan to stimulus movie
+            downsample = int(np.round(np.diff(scani.x).mean() / (2 * np.diff(flip_times[0]).mean())))
+            flip_ix = np.r_[downsample // 2:flip_times[0].size:downsample]
+            r = [np.maximum(0, scani(t[flip_ix])) for t in flip_times]
+            avg_response = avg[opt['trial_mean']](*r)
+            response_m1 = avg_response.mean(axis=-1)
+            response_m2 = (avg_response ** 2).mean(axis=-1)
+
+            if condition['stimulus_type'] == 'stimulus.Monet2':
+                directions, onsets, ori_fraction, duration = (stimulus.Monet2 & condition).fetch1(
+                    'directions', 'onsets', 'ori_fraction', 'duration', squeeze=True)
+                duration = float(duration)
+                t = np.r_[0:flip_times[0].size] / flip_times[0].size * duration
+                design = 0.0
+                offsets = onsets + duration / directions.size * ori_fraction
+                for d, onset, offset in zip(directions, onsets, offsets):
+                    design += np.exp(2j * d * np.pi / 180) * (
+                        (t > onset) * (1 - np.exp((onset - t) / opt['ca_tau'])) -
+                        (t > offset) * (1 - np.exp((offset - t) / opt['ca_tau'])))
+                design = design[flip_ix]
+            else:
+                assert condition['stimulus_type'] == 'stimulus.Trippy', 'invalid stimulus_type'
+                phase_movie = (stimulus.TrippyPhase & condition).fetch1('phase_movie')
+                # spatial smoothing of orientation angles
+                dx, dy, _ = np.gradient(phase_movie)
+                r = dx + 1j * dy
+                design = abs(r) * np.exp(2j * np.angle(r))  # double the angle to convert direction to orientation
+                design /= np.maximum(abs(design), np.percentile(abs(design), 1))
+                smoothen = partial(filters.gaussian_filter,
+                                   sigma=(opt['trippy_spatial_blur'], opt['trippy_spatial_blur'], 0))
+                smooth = smoothen(design.real) + 1j * smoothen(design.imag)
+                # convolve with calcium response and interpolate onto flip_times
+                dt = np.diff(flip_times[0]).mean()
+                ntaps = np.ceil(1.6 * opt['ca_tau'] / dt)
+                t = np.r_[-ntaps:ntaps + 1] * dt
+                kernel = np.exp(-t / opt['ca_tau']) * (t >= 0)
+                kernel = kernel / kernel.sum()
+                ds = opt['trippy_downsample']
+                design = signal.convolve(
+                    smooth[ds // 3:-ds // 6:ds, ds // 3:-ds // 6:ds, :],
+                    kernel[None, None, :], mode='same')
+                design = design[:, :, flip_ix]
+
+            design_m1 = design.mean(axis=-1, keepdims=True)
+            design_m2 = (np.abs(design) ** 2).mean(axis=-1, keepdims=True)
+            xcov = np.tensordot(avg_response, design, [[-1], [-1]]) / design.shape[-1]
+            self.Condition().insert1(dict(
+                key, **condition,
+                design_m1=design_m1.astype('complex64'),
+                design_m2=design_m2.astype('float32'),
+                response_m1=response_m1.astype('float32'),
+                response_m2=response_m2.astype('float32'),
+                xcov=xcov.astype('complex64'),
+                ntrials=flip_times.size,
+                duration=np.diff(flip_times[0]).mean() * flip_times[0].size), ignore_extra_fields=True)
+
+
+@schema
+class PixelwiseOri(dj.Computed):
+    definition = """
+    # Orientation maps for plotting -- works for platinum
+    -> CaTimes
+    -> CaMovie
+    ---
+    monet_map  : longblob  # complex normalized response map
+    trippy_map : longblob  # complex normalize respsonse map
+
+    """
+
+    key_source = CaTimes * CaMovie & (StellarMap & 'stellar=5')
+
+    def make(self, key):
+        def mean(x):
+            return sum(x) / x.size
+
+        rel = StellarMap.Condition & key & 'stellar=5'
+
+        # Trippy map
+        d1, d2, r1, r2, xc = (rel & stimulus.Trippy.proj()).fetch('design_m1', 'design_m2', 'response_m1',
+                                                                  'response_m2', 'xcov', squeeze=True)
+        d1 = mean(d1)
+        d2 = mean(d2)
+        r1 = mean(r1)
+        r2 = mean(r2)
+        xc = mean(xc)
+        xc = (xc - d1[None, None, :, :] * r1[:, :, None, None])  # unbias
+        vd = d2 - abs(d1) ** 2
+        vr = r2 - r1 ** 2
+        xc /= (np.sqrt(vd[None, None, :, :] * vr[:, :, None, None]) + 1e-6)  # normalize
+        xc[abs(xc) < abs(xc).max(keepdims=True, axis=(2, 3))] = np.nan
+        xc = np.nanmean(xc, axis=(2, 3))
+        xc_trippy = xc.conj()  # the trippy map rotates in opposite direction
+
+        # Monet map
+        d1, d2, r1, r2, xc = (rel & stimulus.Monet2.proj()).fetch('design_m1', 'design_m2', 'response_m1',
+                                                                  'response_m2', 'xcov', squeeze=True)
+        d1 = mean(d1)
+        d2 = mean(d2)
+        r1 = mean(r1)
+        r2 = mean(r2)
+        xc = mean(xc)
+
+        xc = (xc - d1 * r1)  # unbias
+        vd = d2 - abs(d1) ** 2
+        vr = r2 - r1 ** 2
+        xc /= np.sqrt(vd * vr + 1e-6)  # normalize
+        xc_monet = xc
+
+        self.insert1(dict(key, monet_map=xc_monet, trippy_map=xc_trippy))
+
+    def plot(self):
+        from matplotlib import pyplot as plt
+        from matplotlib import rcParams
+        from matplotlib import colors
+
+        def make_ori_map(xc):
+            return colors.hsv_to_rgb(np.minimum(1, np.stack((np.angle(xc) / np.pi / 2 % 1, abs(xc), abs(xc)), axis=-1)))
+
+        xc_monet, xc_trippy = self.fetch1('monet_map', 'trippy_map')
+
+        rcParams['figure.figsize'] = [12, 5]
+        rcParams['figure.dpi'] = 150
+        fig, ax = plt.subplots(1, 4)
+        ax[0].imshow(
+            np.maximum(0, np.minimum(1, 4 * (np.stack((abs(xc_monet), abs(xc_trippy), 0 * abs(xc_monet)), axis=-1)))))
+        ax[0].set_title('Combo ori selectivity')
+        ax[1].imshow(make_ori_map(5 * xc_trippy) ** 1.3)
+        ax[1].set_title('Trippy tuning')
+        ax[2].imshow(make_ori_map(5 * xc_monet) ** 1.3)
+        ax[2].set_title('Monet tuning')
+        ax[3].imshow(make_ori_map(3 * (xc_monet + xc_trippy)) ** 1.3)
+        ax[3].set_title('Average tuning')
+        plt.suptitle('Parametric tuning.  {animal_id}::{session}::{scan_idx} [{field}]'.format(**self.fetch1('KEY')))
+        for a in ax:
+            a.grid(True, alpha=0.4)
+            a.set_xticklabels([])
+            a.set_yticklabels([])
+
+
+@schema
+class StellarCellwise(dj.Computed):
+    definition = """
+    -> CaTimes
+    -> CaMovie
+    -> StellarOption
+    """
+
+    class Condition(dj.Part):
+        definition = """
+        -> master
+        -> stimulus.Condition
+        ---
+        design_m1      : longblob    # 1-moment complex-valued
+        design_m2      : longblob    # 2-moment real-valued
+        response_m1    : external-analysis    # 1-moment of scan after trial averaging
+        response_m2    : external-analysis    # 2-moment of scan after trial averaging
+        xcov           : external-analysis    # complex-valued zero-mean cross-covariance of design and response after trial averaging
+        duration            : float    # (s) trial duration
+        ntrials             : smallint # number of valid trials
+        """
+
+    def make(self, key):
+        avg = dict(
+            geometric=lambda x, y: np.sqrt(x * y),
+            arithmetic=lambda x, y: (x + y) / 2)
+        opt = (StellarOption & key).fetch1()
+        scan, scale = (CaMovie & key).fetch1('corrected_scan', 'scale_factor')
+        scan = scan.astype(np.float32) * scale
+
+        field_times = (CaTimes & key).fetch1('times')
+        if field_times.size > scan.shape[2]:
+            warn('Truncated scan!')
+            field_times = field_times[:scan.shape[2]]
+        scani = interp1d(field_times - opt['latency'], scan, copy=False, assume_sorted=True)  # movie on stimulus time
+        self.insert1(key)
+        for condition in stimulus.Condition & (stimulus.Trial & key & [stimulus.Monet2, stimulus.Trippy]):
+
+            flip_times = (stimulus.Trial & condition & key).fetch('flip_times', squeeze=True)
+            passed = len(flip_times) == 2
+            passed = passed and all(t[0] > scani.x[0] and t[-1] < scani.x[-1] for t in flip_times)
+            passed = passed and abs(np.diff(flip_times[0] - flip_times[1])).max() < 0.01
+            if not passed:
+                continue
+
+            # align scan to stimulus movie
+            downsample = int(np.round(np.diff(scani.x).mean() / (2 * np.diff(flip_times[0]).mean())))
+            flip_ix = np.r_[downsample // 2:flip_times[0].size:downsample]
+            r = [np.maximum(0, scani(t[flip_ix])) for t in flip_times]
+            avg_response = avg[opt['trial_mean']](*r)
+            response_m1 = avg_response.mean(axis=-1)
+            response_m2 = (avg_response ** 2).mean(axis=-1)
+
+            if condition['stimulus_type'] == 'stimulus.Monet2':
+                directions, onsets, ori_fraction, duration = (stimulus.Monet2 & condition).fetch1(
+                    'directions', 'onsets', 'ori_fraction', 'duration', squeeze=True)
+                duration = float(duration)
+                t = np.r_[0:flip_times[0].size] / flip_times[0].size * duration
+                design = 0.0
+                offsets = onsets + duration / directions.size * ori_fraction
+                for d, onset, offset in zip(directions, onsets, offsets):
+                    design += np.exp(2j * d * np.pi / 180) * (
+                        (t > onset) * (1 - np.exp((onset - t) / opt['ca_tau'])) -
+                        (t > offset) * (1 - np.exp((offset - t) / opt['ca_tau'])))
+                design = design[flip_ix]
+            else:
+                assert condition['stimulus_type'] == 'stimulus.Trippy', 'invalid stimulus_type'
+                phase_movie = (stimulus.TrippyPhase & condition).fetch1('phase_movie')
+                # spatial smoothing of orientation angles
+                dx, dy, _ = np.gradient(phase_movie)
+                r = dx + 1j * dy
+                design = abs(r) * np.exp(2j * np.angle(r))  # double the angle to convert direction to orientation
+                design /= np.maximum(abs(design), np.percentile(abs(design), 1))
+                smoothen = partial(filters.gaussian_filter,
+                                   sigma=(opt['trippy_spatial_blur'], opt['trippy_spatial_blur'], 0))
+                smooth = smoothen(design.real) + 1j * smoothen(design.imag)
+                # convolve with calcium response and interpolate onto flip_times
+                dt = np.diff(flip_times[0]).mean()
+                ntaps = np.ceil(1.6 * opt['ca_tau'] / dt)
+                t = np.r_[-ntaps:ntaps + 1] * dt
+                kernel = np.exp(-t / opt['ca_tau']) * (t >= 0)
+                kernel = kernel / kernel.sum()
+                ds = opt['trippy_downsample']
+                design = signal.convolve(
+                    smooth[ds // 3:-ds // 6:ds, ds // 3:-ds // 6:ds, :],
+                    kernel[None, None, :], mode='same')
+                design = design[:, :, flip_ix]
+
+            design_m1 = design.mean(axis=-1, keepdims=True)
+            design_m2 = (np.abs(design) ** 2).mean(axis=-1, keepdims=True)
+            xcov = np.tensordot(avg_response, design, [[-1], [-1]]) / design.shape[-1]
+            self.Condition().insert1(dict(
+                key, **condition,
+                design_m1=design_m1.astype('complex64'),
+                design_m2=design_m2.astype('float32'),
+                response_m1=response_m1.astype('float32'),
+                response_m2=response_m2.astype('float32'),
+                xcov=xcov.astype('complex64'),
+                ntrials=flip_times.size,
+                duration=np.diff(flip_times[0]).mean() * flip_times[0].size), ignore_extra_fields=True)
+
+
+@schema
+class Ori(dj.Computed):
+    definition = """
+    # Orientation tuning for cells including monet and trippy conditions
+    -> CaTimes
+    -> fuse.Activity
+    -> StimulusType
+    ori_type  : enum('ori','dir')    # orientation (180 degrees) or direction (360 degrees)
+    ori_version  : tinyint  # in case variants must be compared
+    ---
+    latency      : float     # (s) screen-to-brain latency
+    duration     : float     # (s) total duration of applicable trials
+    """
+
+    class Cell(dj.Part):
+        definition = """
+        -> master
+        -> fuse.Activity.Trace
+        ----
+        variance     : float    # total trace variance
+        angle        : float  # (degrees) preferred orientation or direction
+        selectivity  : float  # [0, 1]
+        r2           : float  # fraction of variance explained
+        """
+
+    conditions = {
+        'stimulus.Monet': stimulus.Monet,
+        'stimulus.Monet2': stimulus.Monet2,
+        'stimulus.Trippy': stimulus.Trippy}
+
+    @property
+    def key_source(self):
+        return super().key_source & (stimulus.Trial * stimulus.Condition & self.conditions.values())
+
+    @staticmethod
+    def _generate_monet_motion_trials(key):
+        """
+        generate dicts containing orientation trials from monet stimuli with
+        onset and offset times and motion directions in radians.
+        """
+        monet1 = stimulus.Monet() * stimulus.Trial()
+        monet2 = (stimulus.Monet2() * stimulus.Trial()).proj(
+            'flip_times', 'onsets', 'directions', 'speed', 'fps',
+            ori_on_secs='round(1000*duration/n_dirs*ori_fraction)/1000')
+        for monet, unit in ((monet1, 'rad'), (monet2, 'degree')):
+            for onsets, directions, ori_duration, times, fps in zip(
+                    *(monet & key & 'speed>0').fetch(
+                        'onsets', 'directions', 'ori_on_secs', 'flip_times', 'fps', squeeze=True)):
+                directions = np.round(directions if unit=='rad' else directions/180*np.pi, decimals=4)
+                assumed_times = np.r_[:times.size] / float(fps)
+                for tup in zip(np.interp(onsets, assumed_times, times),
+                               np.interp(onsets + ori_duration, assumed_times, times), directions):
+                    yield dict(zip(('onset', 'offset', 'direction'), tup))
+
+    def make(self, key):
+        # settings
+        latency = 0.05
+        key['ori_version'] = 0
+
+        # get traces on latency-corrected time
+        pipe = (fuse.Activity() & key).module
+        traces, trace_keys = (pipe.Activity.Trace & key).fetch('trace', 'KEY')
+        original_traces = np.stack(traces)
+        frame_times = (CaTimes & key).fetch1('times') + latency
+
+        # make complex-valued design matrix
+        assert key['stimulus_type'] in {'stimulus.Monet', 'stimulus.Monet2', 'stimulus.Trippy'}
+        for ori_type, angle_multiplier in zip(('ori', 'dir'), (2, 1)):
+            traces = original_traces.copy()
+            key['ori_type'] = ori_type
+            design = duration = 0.0
+            if key['stimulus_type'] in {'stimulus.Monet', 'stimulus.Monet2'}:
+                for trial in self._generate_monet_motion_trials(key):
+                    duration += trial['offset'] - trial['onset']
+                    design += np.exp(angle_multiplier*1j*trial['direction'])*np.logical_and(
+                        trial['onset'] < frame_times, frame_times < trial['offset'])
+            elif key['stimulus_type'] == 'stimulus.Trippy':
+                blur, ds = 4.0, 8
+                for condition in (stimulus.Trippy & (stimulus.Trial & key)).fetch('KEY'):
+                    flip_times = (stimulus.Trial & condition & key).fetch('flip_times', squeeze=True)
+                    phase_movie = (stimulus.TrippyPhase & condition).fetch1('phase_movie')
+                    # spatial smoothing of orientation angles
+                    dx, dy, _ = np.gradient(phase_movie)
+                    r = dx + 1j * dy
+                    r = abs(r) * np.exp(angle_multiplier * 1j * np.angle(r))  # double the angle to convert direction to orientation
+                    r /= np.maximum(abs(r), np.percentile(abs(r), 1))
+                    smoothen = partial(filters.gaussian_filter, sigma=(blur, blur, 0))
+                    r = smoothen(r.real) + 1j * smoothen(r.imag)
+                    # convolve with calcium response and interpolate onto flip_times
+                    r = r[ds // 3:-ds // 6:ds, ds // 3:-ds // 6:ds, :]
+                    for ft in flip_times:
+                        duration += ft[-1] - ft[0] + np.diff(ft).mean()
+                        design += interp1d(ft, r, copy=False, bounds_error=False, fill_value=0.0)(frame_times)
+
+            # clip design if it's shorter than
+            if traces.shape[-1] < design.shape[-1]:
+                design = design[..., :traces.shape[-1]]
+
+            # reduce analysis to periods of stimulus
+            mag = abs(design) ** 2
+            ix = mag.max(axis=tuple(range(design.ndim - 1))) > 1e-4 * mag.max()
+            design = design[..., ix]
+            traces = traces[..., ix]
+
+            # remove orientation bias and normalize
+            design -= design.mean(axis=-1, keepdims=True)  # remove orientation bias
+            design /= np.sqrt((abs(design) ** 2).mean(axis=-1, keepdims=True))
+            means = traces.mean(axis=-1)
+            traces -= means[..., None]
+            variances = (traces ** 2).mean(axis=-1)
+            traces /= np.sqrt(variances[..., None])
+            means /= np.sqrt(variances)
+
+            # compute response
+            xc = np.tensordot(traces, design, ([-1], [-1])) / design.shape[-1]
+
+            # reduce response dimension
+            if xc.ndim > 1:
+                def select_complex(xc):
+                    for x in xc:
+                        yield x.flatten()[abs(x.argmax())]
+                xc = select_complex(xc)
+
+            self.insert1(dict(key, latency=latency, duration=duration))
+            self.Cell().insert(
+                dict(key, **trace_key, selectivity=2*abs(x)/(m+abs(x)), variance=v,
+                     angle=np.angle(x)/angle_multiplier, r2=abs(x)**2)
+                for x, m, v, trace_key in zip(xc, means, variances, trace_keys))
+
+
+@schema
+class Kuiper(dj.Computed):
+    definition = """
+    # Kuiper: circular uniformity test
+    -> Ori
+    ---
+    selectivity_threshold   : float   # only cells above the threshold are considered
+    superthreshold_fraction : float   # fraction above selectivity threshold
+    superthreshold_number   : int     # number of cells above selectivity threshold
+    kuiper                  : float   # 0 = uniform, 1 = completely biased
+    widest_gap              : float   # (radians) - widest excess gap in histogram
+    """
+
+    def make(self, key):
+        pipe = (fuse.Activity & key).module
+        angle_multiplier, thresh = {'ori': (2, 0.35), 'dir': (1, 0.3)}[key['ori_type']]
+        cell = Ori.Cell & key & (pipe.MaskClassification.Type & {'type': "soma"})
+        frac = dj.U().aggr(cell, frac=f'avg(selectivity>{thresh})').fetch1('frac')
+        angles = np.sort((cell & f'selectivity>{thresh}').fetch('angle') * angle_multiplier % (2 * np.pi))
+        n = angles.size
+        if n <= 1:
+            kuiper = 1.0
+            gap = 2 * np.pi / angle_multiplier
+            frac = frac if n else 0
+        else:
+            gap = (np.maximum(
+                np.max(np.diff(angles)),
+                np.max(np.diff((angles + np.pi) % (2 * np.pi)))) - 2 * np.pi / n) / angle_multiplier
+            diff = angles / 2 / np.pi - np.linspace(0.5 / n, 1 - 0.5 / n, n)
+            kuiper = np.maximum(0, np.max(diff)) - np.minimum(0, np.min(diff))
+        self.insert1(dict(key,
+                          selectivity_threshold=thresh,
+                          superthreshold_fraction=frac,
+                          superthreshold_number=n,
+                          kuiper=kuiper, widest_gap=gap))
+
+    def plot(self):
+        import matplotlib.pyplot as plt
+        assert len(self) == 1,  'One Kuiper instance at a time please'
+        angles = (Ori.Cell * self & 'selectivity > selectivity_threshold').fetch('angle') / np.pi * 180
+        plt.subplot(211)
+        plt.hist(angles, 100)
+        plt.subplot(212)
+        plt.hist(angles, 100, cumulative=True)
+        plt.suptitle('{animal_id}::{session}::{scan_idx} Kuiper={kuiper}, Gap={widest_gap}'.format(**self.fetch1()))
