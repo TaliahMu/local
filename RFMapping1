@@ -1,0 +1,205 @@
+#Just blurred dot
+from stimulus import stimulus
+from pipeline import meso,reso,experiment
+
+from pipeline.utils import h5,caiman_interface
+from commons import lab
+import scanreader
+
+import scipy.optimize as opt
+import autograd.numpy as np
+from autograd import grad
+
+from scipy.interpolate import interp1d
+
+from itertools import product,repeat
+import matplotlib.pyplot as plt
+
+import warnings
+warnings.filterwarnings("ignore")
+
+from tqdm import tqdm
+import datajoint as dj
+
+#from stimline.utils import gaussfitter
+from scipy.ndimage import gaussian_filter
+
+import multiprocessing as mp
+import time
+
+def notnan(x, start=0, increment=1):
+    while np.isnan(x[start]) and 0 <= start < len(x):
+        start += increment
+    return start
+
+def spike_traces(X, fps):
+    import c2s
+
+    N = len(X)
+    for i, trace in enumerate(X):
+        print('Predicting trace %i/%i' % (i + 1, N))
+        tr0 = np.array(trace.pop('trace').squeeze())
+        start = notnan(tr0)
+        end = notnan(tr0, len(tr0) - 1, increment=-1)
+        trace['calcium'] = np.atleast_2d(tr0[start:end + 1])
+
+        trace['fps'] = fps
+        data = c2s.preprocess([trace], fps=fps)
+        with suppress_stdout():
+            data = c2s.predict(data, verbosity=-1)
+
+        tr0[start:end + 1] = data[0].pop('predictions')
+        data[0]['rate_trace'] = tr0.T
+        data[0].pop('calcium')
+        data[0].pop('fps')
+
+        yield data[0]
+        
+from contextlib import contextmanager
+import sys, os
+
+@contextmanager
+def suppress_stdout():
+    with open(os.devnull, "w") as devnull:
+        old_stdout = sys.stdout
+        sys.stdout = devnull
+        try:  
+            yield
+        finally:
+            sys.stdout = old_stdout
+            
+            
+def extract_mean_resps(stack_scan,edges,onsets_set,offsets_set,s2f):
+    (r1,r2),(c1,c2) = edges
+    bin_trace = np.nanmean(stack_scan[r1:r2,c1:c2,:],axis=(0,1))
+    t,_ = caiman_interface.deconvolve(bin_trace)
+    if np.nanmin(t) < 0:
+        t = t + np.abs(np.nanmin(t))
+    t = t / np.nanmax(t)
+    f2a = interp1d(np.arange(len(t)),np.cumsum(t))
+
+    mean_resp = [np.nanmean([np.diff(f2a(s2f((onset,offset)))) for onset,offset in zip(onsets,offsets)])
+                for onsets,offsets in zip(onsets_set,offsets_set)]
+    return mean_resp
+
+def abs_bins(vals,n_bins): return np.linspace(np.min(vals),np.max(vals),n_bins+1)
+def shift(bins): return bins[:-1],bins[1:]
+
+def plot_bins(key,n_bins=10):
+    directory = '/data/Dropbox/figures/dot_mapping/widefield_dotmapping/'
+    title = '_'.join([str(v) for v in key.values()])
+    scaling = 3
+    dpi = 200
+
+    # uses ScanInfo for correcting sync and fps
+    print('populating upstream')
+    if len(meso.ScanInfo & key) < 1:
+        meso.ScanInfo.populate(key)
+    # uses Sync to align scan to frames
+    if len(stimulus.Sync & key) < 1:
+        stimulus.Sync.populate(key)
+
+    print('fetching scan')
+    scan_filenames = (experiment.Scan & key).local_filenames_as_wildcard
+    scan = scanreader.read_scan(scan_filenames) # for mesoscope, returns (fields x pixel_height x pixel_width x channel x frame) matrix, vertically concatenating all scan fields in the same plane
+    my_scan = scan[:]
+
+
+    nfields = my_scan.shape[0]
+    x_zero, y_zero, _ = scan.motor_position_at_zero  # motor x, y at ScanImage's 0
+    xs = [x_zero + scan._degrees_to_microns(scan.fields[field_id].x) for field_id in np.arange(nfields)]
+    ys = [x_zero + scan._degrees_to_microns(scan.fields[field_id].y) for field_id in np.arange(nfields)]
+    fps = scan.fps
+
+    sort_im = sorted(zip(my_scan.squeeze(),xs),key=lambda x:x[1])
+    stack_scan = np.hstack([a for a,b in sort_im]).squeeze()
+
+    dot_rel = ((stimulus.Trial & key) * stimulus.SingleDot)
+
+    xsize,ysize = (dj.U('dot_xsize','dot_ysize') & dot_rel).fetch1('dot_xsize','dot_ysize')
+
+    xs,ys = (dj.U('dot_x','dot_y') & dot_rel).fetch('dot_x','dot_y',order_by = ('dot_x ASC','dot_y ASC'))
+    x_set,y_set = [sorted(list(set(coord))) for coord in [xs,ys]]
+    x_num,y_num = len(x_set),len(y_set)
+    x_mat,y_mat = np.meshgrid(x_set,y_set)
+
+
+    mon_width = 55.3 # width of monitor in centimeters
+    mon_rel = experiment.DisplayGeometry() & 'animal_id = 18765 and session = 4'
+    mon_aspect = float(mon_rel.fetch1('monitor_aspect'))
+
+    y_mat_size = 100
+    x_mat_size = int(y_mat_size * mon_aspect)
+    mat = np.full((y_mat_size,x_mat_size),np.nan)
+
+
+    print('projecting dots to monitor')
+    def dot2mon(dot_image):
+        mon_mat = mat.copy()
+        for (y,x),resp in zip(product(y_set,x_set), np.hstack(dot_image)):
+            xmin = int((np.max((x - xsize/2,-0.5))+0.5)*x_mat_size)
+            xmax = int((np.min((x + xsize/2,0.5))+0.5)*x_mat_size)
+            ymax = int((np.min((y*mon_aspect + (ysize*mon_aspect)/2,0.5))+0.5)*y_mat_size)
+            ymin = int((np.max((y*mon_aspect - (ysize*mon_aspect)/2,-0.5))+0.5)*y_mat_size)
+            mon_mat[ymin:ymax,xmin:xmax] = np.full((np.abs(ymax-ymin),np.abs(xmax-xmin)),resp)
+        return mon_mat
+
+
+    vmin = np.percentile(np.nanmean(stack_scan,axis=2),10)
+    vmax = np.percentile(np.nanmean(stack_scan,axis=2),99.95)
+
+    c_bins = abs_bins(np.arange(stack_scan.shape[1]+1),n_bins).astype(int)
+    r_bins = abs_bins(np.arange(stack_scan.shape[0]+1),n_bins).astype(int)
+
+    print('syncing trace')
+    stim_sync = (stimulus.Sync & key).fetch1('frame_times')
+    nfields,nrois,fps = (meso.ScanInfo & key).fetch1('nfields','nrois','fps')
+    s2f = interp1d(stim_sync.squeeze(),np.arange(np.size(stim_sync))/(nfields/nrois)) #frame to stimulus clock
+
+    onsets_set,offsets_set = [],[]
+    for y,x in product(y_set,x_set):
+        x_restrict = f'dot_x > {x - 0.01} and dot_x < {x + 0.01}'
+        y_restrict = f'dot_y > {y - 0.01} and dot_y < {y + 0.01}'
+        flip_times = (dot_rel & x_restrict & y_restrict).fetch('flip_times')
+        onsets,offsets = [np.array([flip_time[0][i] for flip_time in flip_times]) for i in [0,-1]]
+        trial_idx = np.all(np.vstack((onsets > np.min(stim_sync),offsets < np.max(stim_sync))),axis=0)
+        onsets,offsets = onsets[trial_idx],offsets[trial_idx]
+        onsets_set.append(onsets)
+        offsets_set.append(offsets)
+
+
+    n_edges = (len(r_bins) - 1) * (len(c_bins) - 1)
+    edges = product(zip(*shift(r_bins)),zip(*shift(c_bins)))
+    input_iter = zip(repeat(stack_scan,n_edges),edges,
+                     repeat(onsets_set,n_edges),repeat(offsets_set,n_edges),
+                     repeat(s2f,n_edges))
+
+    with suppress_stdout():
+        with mp.Pool(8) as pool:
+            mean_resps = pool.starmap(extract_mean_resps, input_iter)
+    mean_resps = [dot2mon(mean_resp) for mean_resp in mean_resps]
+
+
+    resp_max = np.nanmax(np.array(mean_resps))
+
+    gauss_resps = []
+    sigma = np.nanmean(np.diff(x_set)) * x_mat_size / 2
+    for mean_resp in mean_resps:
+        gauss_resp = mean_resp.copy()
+        gauss_resp[np.isnan(gauss_resp)] = 0
+        gauss_resp = gaussian_filter(gauss_resp,sigma = sigma) ** 2
+        gauss_resps.append(gauss_resp)
+
+    fig,axes = plt.subplots(n_bins,n_bins,figsize=(n_bins*scaling, n_bins*scaling))    
+    fig.set_facecolor('k')
+    axes = np.concatenate(axes)
+    gauss_max = np.nanmax(gauss_resps)
+    for gauss_resp,ax in zip(gauss_resps,axes):
+        ax.matshow(gauss_resp,vmin=0)
+        ax.set_aspect('equal')
+        ax.set_axis_off()
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0,wspace=0,hspace=0)
+    plt.tight_layout(pad=0, w_pad=0, h_pad=0)
+    plt.savefig(title+'_blur.png',dpi=200,facecolor='k')
+    plt.show()
+    plt.close()
