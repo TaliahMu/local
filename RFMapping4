@@ -1,0 +1,192 @@
+#5/15 Widefield Update
+from stimulus import stimulus
+from pipeline import meso,reso,experiment
+import datajoint as dj
+
+import scanreader
+from pipeline.utils import caiman_interface
+
+import matplotlib.pyplot as plt
+
+import cv2
+import numpy as np
+from scipy.interpolate import interp1d
+from scipy.ndimage import gaussian_filter,binary_dilation
+
+import time
+from tqdm import tqdm
+import multiprocessing as mp
+from itertools import product,repeat
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import sys, os
+from contextlib import contextmanager
+
+@contextmanager
+def suppress_stdout():
+    with open(os.devnull, "w") as devnull:
+        old_stdout = sys.stdout
+        sys.stdout = devnull
+        try:  
+            yield
+        finally:
+            sys.stdout = old_stdout
+
+def extract_mean_resps(trace, onsets_set, offsets_set, s2f):
+    # deconvolves and normalizes trace, then returns mean responses for each onset/offset set
+    warnings.filterwarnings("ignore")
+    t, _ = caiman_interface.deconvolve(trace)
+    if np.nanmin(t) < 0:
+        t = t + np.abs(np.nanmin(t))
+    t = t / np.nanmax(t)
+    f2a = interp1d(np.arange(len(t)), np.cumsum(t))
+
+    mean_resp = [np.nanmean([np.diff(f2a(s2f((onset, offset)))) for onset, offset in zip(onsets, offsets)])
+                 for onsets, offsets in zip(onsets_set, offsets_set)]
+    return mean_resp
+
+def abs_bins(vals,n_bins): return np.linspace(np.min(vals),np.max(vals),n_bins+1)
+def shift(bins): return bins[:-1],bins[1:]
+
+def nanfilt(dotmap, sigma=5):
+    sigma = np.round(sigma).astype(int)
+    U = np.array(dotmap)
+
+    V = U.copy()
+    V[np.isnan(U)] = 0
+    VV = gaussian_filter(V, sigma=sigma)
+
+    W = 0 * U.copy() + 1
+    W[np.isnan(U)] = 0
+    WW = gaussian_filter(W, sigma=sigma)
+
+    Z = VV / WW
+
+    mask = binary_dilation(np.invert(np.isnan(dotmap)), structure=np.ones((sigma, sigma)))
+    Z[np.invert(mask)] = np.nan
+
+    return Z ** 2
+
+def plot_bins(key,n_x_bins=20,scale=0.1):
+    start = time.time()
+    pop_rels = [stimulus.Sync,meso.ScanInfo]
+
+    for pop_rel in pop_rels:
+        if len(pop_rel & key) < 1:
+            print('populating' + pop_rel.table_name.replace('__', ' ').replace('_', ' ') + '...')
+            pop_rel.populate(key, reserve_jobs=True)
+
+
+    print('fetching and resizing scan')
+    scan_filenames = (experiment.Scan & key).local_filenames_as_wildcard
+    scan = scanreader.read_scan(scan_filenames) # for mesoscope, returns (fields x pixel_height x pixel_width x channel x frame) matrix, vertically concatenating all scan fields in the same plane
+    my_scan = scan[:]
+
+    nfields = my_scan.shape[0]
+    x_zero, y_zero, _ = scan.motor_position_at_zero  # motor x, y at ScanImage's 0
+    xs = [x_zero + scan._degrees_to_microns(scan.fields[field_id].x) for field_id in np.arange(nfields)]
+    ys = [x_zero + scan._degrees_to_microns(scan.fields[field_id].y) for field_id in np.arange(nfields)]
+    fps = scan.fps
+
+    sort_im = sorted(zip(my_scan.squeeze(),xs),key=lambda x:x[1])
+    stack_scan = np.hstack([a for a,b in sort_im]).squeeze().transpose([2,0,1])
+
+    resize_w = np.round(stack_scan.shape[2]/n_x_bins).astype(int)
+    resize_h = np.round(stack_scan.shape[1]/resize_w*1.7).astype(int)
+    downsample_scan = np.stack([cv2.resize(m, (resize_w, resize_h), interpolation=cv2.INTER_AREA)
+                                for m in stack_scan], axis=0)
+
+
+    print('collecting dot trial information')
+    # fetch and correct sync information for interpolating onset/offset times
+    ndepths = len(dj.U('z') & (meso.ScanInfo.Field & key))
+    stim_sync = (stimulus.Sync & key).fetch1('frame_times')
+    s2f = interp1d(stim_sync.squeeze(), np.arange(np.size(stim_sync)) / (ndepths))  # frame to stimulus clock
+
+
+    dot_rel = ((stimulus.Trial & key) * stimulus.SingleDot)
+    dot_param_str = ['dot_x', 'dot_y', 'dot_xsize', 'dot_ysize','dot_shape']
+    cond_rel = dot_rel.proj('dot_shape',
+                            dot_xsize='CAST(dot_xsize AS DECIMAL(4,4))',
+                            dot_ysize='CAST(dot_ysize AS DECIMAL(4,4))',
+                            dot_x='CAST(dot_x AS DECIMAL(4,4))',
+                            dot_y='CAST(dot_y AS DECIMAL(4,4))')
+    cond_rel = dj.U('condition_hash',*dot_param_str) & (stimulus.Condition * cond_rel)
+
+    shape_rel = dj.U('dot_shape') & cond_rel
+    assert shape_rel.fetch1('dot_shape') == 'rect', 'only rectangular dots currently supported'
+
+    trial_rel = (stimulus.Trial & key) * cond_rel
+
+    param_keys = (dj.U(*dot_param_str) & trial_rel).fetch('KEY',order_by = ['dot_y','dot_x'])
+    xs, ys, xsizes, ysizes, onsets_set, offsets_set = [], [], [], [], [], []
+    for param_set in param_keys:
+        x, y, xsize, ysize, _, flip_times = (trial_rel & param_set).fetch(*dot_param_str, 'flip_times')
+        xs.append(float(param_set['dot_x']))
+        ys.append(float(param_set['dot_y']))
+        xsizes.append(float(param_set['dot_xsize']))
+        ysizes.append(float(param_set['dot_ysize']))
+        onsets, offsets = [np.array([flip_time[0][i] for flip_time in flip_times]) for i in [0, -1]]
+        trial_idx = np.all(np.vstack((onsets > np.min(stim_sync), offsets < np.max(stim_sync))), axis=0)
+        onsets, offsets = onsets[trial_idx], offsets[trial_idx]
+        onsets_set.append(onsets)
+        offsets_set.append(offsets)
+
+    print('calculating dot responses')
+    # for each pixel trace, calculate a dotmap from the mean response to each dot location
+    pix_scan = np.concatenate(downsample_scan.transpose([1, 2, 0]), axis=0)
+    n_pix = len(pix_scan)
+    input_iter = zip(pix_scan, repeat(onsets_set, n_pix), repeat(offsets_set, n_pix), repeat(s2f, n_pix))
+    with suppress_stdout():
+        with mp.Pool(30) as pool:
+            mean_resps = pool.starmap(extract_mean_resps, input_iter)
+
+    print('converting to monitor images')
+    # create oversized screen to plot dots into
+    pre_downsample_mon_height = 1000
+    dotmap_pxw, dotmap_pxh = 160, 90
+    mon_aspect = float(16/9)
+
+    y_mat_size = pre_downsample_mon_height
+    x_mat_size = np.round(y_mat_size * mon_aspect).astype(int)
+    mat = np.full((y_mat_size, x_mat_size), np.nan)
+
+    def dot2mon(mean_resps, xs, ys, xsizes, ysizes):
+        mon_mat = mat.copy()
+        for x, y, xsize, ysize, mean_resp in zip(xs, ys, xsizes, ysizes, mean_resps):
+            xmin = int((np.max((x - xsize / 2, -0.5)) + 0.5) * x_mat_size)
+            xmax = int((np.min((x + xsize / 2, 0.5)) + 0.5) * x_mat_size)
+            ymax = int((np.min((y * mon_aspect + (ysize * mon_aspect) / 2, 0.5)) + 0.5) * y_mat_size)
+            ymin = int((np.max((y * mon_aspect - (ysize * mon_aspect) / 2, -0.5)) + 0.5) * y_mat_size)
+            mon_mat[ymin:ymax, xmin:xmax] = np.full((np.abs(ymax - ymin), np.abs(xmax - xmin)), mean_resp)
+        mon_mat = cv2.resize(mon_mat, (dotmap_pxw, dotmap_pxh), interpolation=cv2.INTER_AREA)
+        return mon_mat
+    mon_maps = [dot2mon(mean_resp, xs, ys, xsizes, ysizes) for mean_resp in mean_resps]
+
+    print('filtering')
+    # pass each dotmap through gaussian filter
+    sigma = int(np.round(np.max([np.max(np.diff(sorted(list(set(coord))))) * dim
+                                 for coord, dim in zip((ys, xs), (dotmap_pxh, dotmap_pxw))])))
+
+    input_iter = zip(mon_maps, repeat(sigma, len(mon_maps)))
+    with mp.Pool(30) as pool:
+        blurred_maps = pool.starmap(nanfilt, input_iter)
+
+
+    print('plotting')
+    r,c = resize_h,resize_w
+    figsize=np.flip(np.array(stack_scan.shape[1:]) * scale,axis=0)
+    fig,axes = plt.subplots(r,c,figsize=(figsize),facecolor='black')
+
+    for blurred_map,ax in zip(blurred_maps,np.concatenate(axes)):
+        ax.matshow(blurred_map)
+        ax.set_aspect('equal')
+        ax.set_axis_off()
+    plt.show()
+    title = '_'.join([str(v) for v in key.values()])
+    plt.savefig(title+'_blurdotmap.png')
+    plt.close('all')
+    
+    print('total time: ' + str(time.time() - start))
